@@ -273,11 +273,27 @@ def _cleanup_loop():
             try:
                 mtime = os.path.getmtime(task.folder)
             except OSError:
-                mtime = time.time() + TASK_RETENTION_SECONDS  # 目录已异常，尽快清理
+                mtime = 0.0  # 目录已异常（可能已被删），视为过期尽快清理
             if now - mtime > TASK_RETENTION_SECONDS:
                 with REGISTRY._lock:
                     REGISTRY._tasks.pop(task.id, None)
                 shutil.rmtree(task.folder, ignore_errors=True)
+
+        # 兜底清理孤儿目录：服务重启后 REGISTRY 清空，旧任务目录不扫就永远留下。
+        # 只要目录超过保留时长（无论是否在内存任务表中）都回收，防止磁盘被吃满。
+        try:
+            for name in os.listdir(UPLOAD_DIR):
+                folder = os.path.join(UPLOAD_DIR, name)
+                if not os.path.isdir(folder):
+                    continue
+                try:
+                    mtime = os.path.getmtime(folder)
+                except OSError:
+                    continue
+                if now - mtime > TASK_RETENTION_SECONDS:
+                    shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
