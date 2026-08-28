@@ -8,6 +8,7 @@
 """
 
 import glob
+import logging
 import os
 import re
 import shutil
@@ -187,24 +188,31 @@ def _run_pipeline(task, opts):
     """在后台线程中执行：语音转写 -> 烧录字幕 -> 产出最终视频。"""
     try:
         # 1) 语音转写
-        task.update(stage='transcribing', progress=5, message='正在识别语音(可能较慢)')
+        # 注：首次使用某个模型时需要联网下载，可能耗时数分钟。
+        task.update(stage='transcribing', progress=5,
+                    message='正在加载语音识别模型(首次运行需下载，可能较慢)')
         transcribe_args = TranscribeArgs(
             lang=opts['lang'],
             whisper_model=opts['model'],
             vad=TRANSCRIBE_OPTS.vad,
             device=TRANSCRIBE_OPTS.device,
             delay_seconds=TRANSCRIBE_OPTS.delay_seconds)
+        # 转写子模块上报的 pct 是 0~1 的小数：映射到总进度 5%~50%。
+        # （原实现写成 int(pct * 0.45)，对 0~1 的小数取整恒为 0，
+        #   导致转写全程进度永远停在 5% —— 这就是"卡在5%"的显示层根因。）
         transcribe = Transcribe(
             transcribe_args,
-            progress_cb=lambda stage, pct, msg: task.update(stage, 5 + int(pct * 0.45), msg))
+            progress_cb=lambda stage, pct, msg: task.update(
+                stage, 5 + int(pct * 45), msg))
         srt_path = transcribe.run_single(task.src_path)
 
         # 2) 字幕烧录（ffmpeg，只重编码字幕叠加后的视频，不整片 Python 逐帧处理）
-        task.update(stage='burning', progress=55, message='正在烧录字幕')
+        task.update(stage='burning', progress=50, message='语音识别完成，正在烧录字幕')
         burner = RealizeAddSubtitles(
             task.src_path, srt_path, out_path=task.out_path, style=opts['style'])
+        # ffmpeg 子进程上报的 pct 是 0~100：映射到总进度 50%~100%
         burner.burn(progress_cb=lambda pct: task.update(
-            stage='burning', progress=55 + int(pct * 0.45),
+            stage='burning', progress=50 + int(pct * 0.5),
             message=f'正在烧录字幕 {pct:.0f}%'))
 
         if not os.path.isfile(task.out_path) or os.path.getsize(task.out_path) == 0:
@@ -222,6 +230,39 @@ def _run_pipeline(task, opts):
 
 def _dispatch_pipeline(task, opts):
     threading.Thread(target=_run_pipeline, args=(task, opts), daemon=True).start()
+
+
+def _warmup_model():
+    """启动时后台预热默认模型：把「首次下载/加载」的成本移到服务启动阶段，
+    避免第一个用户任务长时间停在 5%（加载模型）。
+    预热失败只记日志，不影响服务启动。"""
+    model_name = (os.environ.get('WHISPER_WARMUP_MODEL')
+                  or os.environ.get('WHISPER_MODEL')
+                  or 'base')
+    try:
+        args = TranscribeArgs(whisper_model=model_name)
+        # noqa 以下 import 仅为复用 _get_model 的超时保护
+        from transcribe import _get_model
+        _get_model(args)
+        logging.getLogger(__name__).info(f'Warmup model {model_name} ready')
+    except Exception as e:  # noqa: BLE001 - 预热失败不影响服务
+        logging.getLogger(__name__).warning(
+            f'模型 {model_name} 预热失败（首个任务会再次尝试）：{e}')
+
+
+_WARMUP_ONCE_LOCK = threading.Lock()
+_warmup_started = False
+
+
+def _start_warmup():
+    """只触发一次的模型预热（python app.py 与 waitress 等 WSGI 启动方式都覆盖：
+    主入口启动时调用一次；首个上传请求时兜底再调用一次，已启动则直接返回）。"""
+    global _warmup_started
+    with _WARMUP_ONCE_LOCK:
+        if _warmup_started:
+            return
+        _warmup_started = True
+    threading.Thread(target=_warmup_model, daemon=True, name='model-warmup').start()
 
 
 def _cleanup_loop():
@@ -280,6 +321,9 @@ def upload():
     task = Task(task_id, src_path, out_path, src_name)
     REGISTRY.create(task)
 
+    # 兜底触发一次模型预热（若主入口未启动/被跳过，这里补上）
+    _start_warmup()
+
     task.update(stage='uploaded', progress=2, message='正在保存上传文件')
     # 分块写入磁盘，避免整个大文件长时间驻留内存
     try:
@@ -312,6 +356,8 @@ def download(task_id):
 
 if __name__ == '__main__':
     threading.Thread(target=_cleanup_loop, args=(), daemon=True).start()
+    # 启动时后台预热默认模型，避免第一个用户任务长时间停在「加载模型」
+    _start_warmup()
     # 多线程并发，单次大上传不再阻塞其它请求。
     # 端口经环境变量 PORT 可配（默认 8081）。
     # 生产环境建议改用 waitress：`pip install waitress`，改调用 wsgi 服务器。

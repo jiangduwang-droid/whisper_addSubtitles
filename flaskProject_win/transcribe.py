@@ -30,24 +30,64 @@ class TranscribeArgs:
 # ---------------------------------------------------------------------------
 # 全局 whisper 模型缓存：模型加载一次、全进程复用。
 # small 模型约 1GB 内存/加载耗时以分钟计，原始代码每个请求都重载，是主要瓶颈之一。
+#
+# 修复「任务卡在 5% 不动」的关键点：
+# 原实现把「下载+加载」放在全局锁内，一旦某次加载（含模型下载）挂起，
+# 锁被永久持有，后续所有任务都会在锁上排队，永远停在 5%。
+# 现在改为：缓存锁只保护字典读写；加载放到子线程并带总超时（默认 600 秒），
+# 超时立即抛错，任务标记 failed 并给出可操作的提示，而不是永久挂起。
 # ---------------------------------------------------------------------------
-_MODEL_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
 _MODEL_CACHE = {}
+# 模型加载（含首次下载）总超时（秒）：超时即失败报错，不再无限等待
+_MODEL_LOAD_TIMEOUT = float(os.environ.get('WHISPER_MODEL_LOAD_TIMEOUT', '600'))
+
+
+def _load_model_blocking(args):
+    """实际执行模型下载 + 加载（可能较慢），失败抛异常。"""
+    import whisper
+    logging.info(f'Loading whisper model {args.whisper_model}')
+    tic = time.time()
+    model = whisper.load_model(args.whisper_model, args.device)
+    logging.info(f'whisper model loaded in {time.time() - tic:.1f} sec')
+    return model
 
 
 def _get_model(args):
     key = (args.whisper_model, args.device)
-    with _MODEL_LOCK:
+    with _CACHE_LOCK:
         model = _MODEL_CACHE.get(key)
-        if model is None:
-            # 延迟 import，避免在只有批处理/其它用法时也强制拉起 torch
-            import whisper
-            logging.info(f'Loading whisper model {key}')
-            tic = time.time()
-            model = whisper.load_model(args.whisper_model, args.device)
-            _MODEL_CACHE[key] = model
-            logging.info(f'whisper model loaded in {time.time() - tic:.1f} sec')
+    if model is not None:
         return model
+
+    # 加载放到子线程并带超时等待：下载挂起时任务会明确报错，而不是永久卡住
+    result = {}
+
+    def _worker():
+        try:
+            result['model'] = _load_model_blocking(args)
+        except Exception as e:  # noqa: BLE001 - 加载异常带回调用方
+            result['error'] = e
+
+    t = threading.Thread(target=_worker, daemon=True,
+                         name=f'whisper-load-{args.whisper_model}')
+    t.start()
+    t.join(_MODEL_LOAD_TIMEOUT)
+
+    if t.is_alive():
+        raise RuntimeError(
+            f'语音识别模型 {args.whisper_model} 加载超时'
+            f'（超过 {int(_MODEL_LOAD_TIMEOUT)} 秒）。'
+            f'首次运行需联网下载模型，请检查网络连通性后重试；'
+            f'或先在本机手动预下载一次模型，再重启服务。')
+    if 'error' in result:
+        raise RuntimeError(
+            f'语音识别模型 {args.whisper_model} 加载失败：{result["error"]}')
+
+    model = result['model']
+    with _CACHE_LOCK:
+        _MODEL_CACHE[key] = model
+    return model
 
 
 class Transcribe:

@@ -29,7 +29,7 @@
                         </svg>
                     </div>
                     <div class="lead">拖拽视频到这里，或点击选择</div>
-                    <div class="hint">单个文件最大 2GB</div>
+                    <div class="hint">单个文件最大 {{ '%g'|format(max_upload_bytes / 1073741824) }}GB</div>
                     <div class="formats">.mp4 · .avi · .mov · .mkv · .flv</div>
                     <input type="file" id="fileInput" accept=".mp4,.avi,.mov,.mkv,.flv" />
                 </div>
@@ -331,9 +331,14 @@
             xhr.send(fd);
         });
 
+        let stuckKey = null;
+        let stuckSince = 0;
+
         function pollStatus(taskId) {
             if (pollTimer) clearInterval(pollTimer);
             setPhase('processing');
+            stuckKey = null;
+            stuckSince = 0;
             pollTimer = setInterval(async () => {
                 try {
                     const resp = await fetch('/api/status/' + taskId);
@@ -355,7 +360,16 @@
                     } else {
                         // 后端 progress 仅在转写/烧录阶段有意义
                         if (data.stage === 'transcribing' || data.stage === 'burning') {
-                            setProgress(data.progress, data.message || data.stage);
+                            // 进度超过 2 分钟无变化时给出提示（首次运行需下载识别模型）
+                            const key = data.stage + ':' + data.progress;
+                            const now = Date.now();
+                            if (key !== stuckKey) { stuckKey = key; stuckSince = now; }
+                            let hint = '';
+                            if (now - stuckSince > 120000) {
+                                hint = '（较长时间无新进展：首次运行需下载识别模型，'
+                                    + '请耐心等待；持续不动请联系管理员检查服务器网络）';
+                            }
+                            setProgress(data.progress, (data.message || data.stage) + hint);
                         }
                     }
                 } catch (e) {

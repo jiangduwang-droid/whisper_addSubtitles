@@ -136,17 +136,24 @@ def _run_pipeline(task):
     """在后台线程中执行：语音转写 -> 烧录字幕 -> 产出最终视频。"""
     try:
         # 1) 语音转写
-        task.update(stage='transcribing', progress=5, message='正在识别语音(可能较慢)')
+        # 注：首次使用某个模型时需要联网下载，可能耗时数分钟。
+        task.update(stage='transcribing', progress=5,
+                    message='正在加载语音识别模型(首次运行需下载，可能较慢)')
+        # 转写子模块上报的 pct 是 0~1 的小数：映射到总进度 5%~50%。
+        # （原实现写成 int(pct * 0.45)，对 0~1 的小数取整恒为 0，
+        #   导致转写全程进度永远停在 5% —— 这就是"卡在5%"的显示层根因。）
         transcribe = Transcribe(
             TRANSCRIBE_OPTS,
-            progress_cb=lambda stage, pct, msg: task.update(stage, 5 + int(pct * 0.45), msg))
+            progress_cb=lambda stage, pct, msg: task.update(
+                stage, 5 + int(pct * 45), msg))
         srt_path = transcribe.run_single(task.src_path)
 
         # 2) 字幕烧录（ffmpeg，只重编码字幕叠加后的视频，不整片 Python 逐帧处理）
-        task.update(stage='burning', progress=55, message='正在烧录字幕')
+        task.update(stage='burning', progress=50, message='语音识别完成，正在烧录字幕')
         burner = RealizeAddSubtitles(task.src_path, srt_path, out_path=task.out_path)
+        # ffmpeg 子进程上报的 pct 是 0~100：映射到总进度 50%~100%
         burner.burn(progress_cb=lambda pct: task.update(
-            stage='burning', progress=55 + int(pct * 0.45),
+            stage='burning', progress=50 + int(pct * 0.5),
             message=f'正在烧录字幕 {pct:.0f}%'))
 
         if not os.path.isfile(task.out_path) or os.path.getsize(task.out_path) == 0:
