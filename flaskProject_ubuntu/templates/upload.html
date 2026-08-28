@@ -98,6 +98,38 @@
                     </div>
                 </div>
 
+                <!-- 字幕校对编辑器 -->
+                <div class="editor" id="editorPanel" style="display:none;">
+                    <div class="ed-head">
+                        <div class="ed-title">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
+                            </svg>
+                            字幕校对
+                        </div>
+                        <div class="ed-tip">播放视频对照画面调整字幕：点「定位」跳到该句；播放中当前句自动高亮；
+                            拖到句子开始/结束处点「设起点/设终点」对齐画面。</div>
+                    </div>
+                    <div class="ed-body">
+                        <div class="ed-video">
+                            <div class="video-box" id="videoBox">
+                                <video id="editVideo" controls preload="metadata"></video>
+                                <div class="subtitle-overlay" id="subtitleOverlay"></div>
+                            </div>
+                            <div class="video-ctrl">
+                                <span class="v-time" id="videoTime">00:00.0</span>
+                                <button type="button" class="mini-btn" id="addHereBtn">+ 在当前位置插入字幕</button>
+                            </div>
+                        </div>
+                        <div class="ed-list" id="subtitleList"></div>
+                    </div>
+                    <div class="ed-actions">
+                        <button type="button" class="btn btn-primary" id="confirmEditBtn">确认并烧录字幕</button>
+                        <button type="button" class="btn btn-ghost" id="saveEditBtn">仅保存</button>
+                        <button type="button" class="btn btn-ghost" id="skipEditBtn">跳过校对，直接烧录</button>
+                    </div>
+                </div>
+
                 <!-- 步骤指示 -->
                 <div class="steps" id="steps">
                     <div class="step active" data-step="1">
@@ -110,10 +142,14 @@
                     </div>
                     <div class="step" data-step="3">
                         <div class="node">3</div>
-                        <div class="s-label">烧录字幕</div>
+                        <div class="s-label">校对字幕</div>
                     </div>
                     <div class="step" data-step="4">
                         <div class="node">4</div>
+                        <div class="s-label">烧录字幕</div>
+                    </div>
+                    <div class="step" data-step="5">
+                        <div class="node">5</div>
                         <div class="s-label">完成下载</div>
                     </div>
                 </div>
@@ -161,13 +197,32 @@
         const downloadLink = document.getElementById('downloadLink');
         const notice = document.getElementById('notice');
 
+        // 字幕校对编辑器
+        const editorPanel = document.getElementById('editorPanel');
+        const editVideo = document.getElementById('editVideo');
+        const videoBox = document.getElementById('videoBox');
+        const subtitleOverlay = document.getElementById('subtitleOverlay');
+        const videoTime = document.getElementById('videoTime');
+        const addHereBtn = document.getElementById('addHereBtn');
+        const subtitleList = document.getElementById('subtitleList');
+        const confirmEditBtn = document.getElementById('confirmEditBtn');
+        const saveEditBtn = document.getElementById('saveEditBtn');
+        const skipEditBtn = document.getElementById('skipEditBtn');
+
         let selectedFile = null;
         let pollTimer = null;
         let xhr = null;
-        let phase = 'idle';        // idle | ready | uploading | processing | done
+        let phase = 'idle';        // idle | ready | uploading | processing | editing | done
         let userCancel = false;
 
-        const STAGE_STEP = { uploaded: 1, pending: 1, transcribing: 2, burning: 3, done: 4 };
+        // 校对状态
+        let editTaskId = null;
+        let editStyle = { font_size: 32, text_color: '#FFFFFF', outline_color: '#000000' };
+        let subRows = [];          // {start, end, text} —— 渲染数据源
+        let editDirty = false;
+        let activeIdx = -1;
+
+        const STAGE_STEP = { uploaded: 1, pending: 1, transcribing: 2, awaiting_edit: 3, burning: 4, done: 5 };
 
         function fmtSize(bytes) {
             if (bytes === 0) return '0 B';
@@ -219,11 +274,11 @@
 
         function setPhase(p) {
             phase = p;
-            const active = (p === 'uploading' || p === 'processing');
+            const active = (p === 'uploading' || p === 'processing' || p === 'editing');
             submitBtn.disabled = !selectedFile || active || p === 'done';
             resetBtn.textContent = p === 'uploading' ? '取消上传'
-                : (p === 'processing' ? '重新上传' : '重新选择');
-            // 处理期间锁定设置，避免改动不生效造成困惑
+                : ((p === 'processing' || p === 'editing') ? '重新上传' : '重新选择');
+            // 处理/校对期间锁定设置，避免改动不生效造成困惑
             document.querySelectorAll('#optionsPanel select, #optionsPanel input')
                 .forEach((el) => { el.disabled = active; });
         }
@@ -233,6 +288,7 @@
             userCancel = true;
             if (xhr) { try { xhr.abort(); } catch (e) {} xhr = null; }
             if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+            closeEditor();
             selectedFile = null;
             fileInput.value = '';
             fileinfo.classList.remove('show');
@@ -357,6 +413,12 @@
                         clearInterval(pollTimer);
                         pollTimer = null;
                         fail(data.error || '处理失败');
+                    } else if (data.stage === 'awaiting_edit') {
+                        // 转写完成：进入人工校对，停止轮询（烧录要等用户确认后才开始）
+                        clearInterval(pollTimer);
+                        pollTimer = null;
+                        setProgress(data.progress || 48, data.message || '字幕已生成，请校对');
+                        openEditor(taskId);
                     } else {
                         // 后端 progress 仅在转写/烧录阶段有意义
                         if (data.stage === 'transcribing' || data.stage === 'burning') {
@@ -377,6 +439,278 @@
                 }
             }, 1000);
         }
+
+        // =====================================================================
+        // 字幕校对编辑器
+        // =====================================================================
+
+        // 时间工具：显示 m:ss.ms / h:mm:ss.ms；解析支持两种写法和纯秒数
+        function fmtTime(sec) {
+            if (sec == null || isNaN(sec)) return '';
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            const s = sec % 60;
+            const mm = String(m).padStart(2, '0');
+            const ss = s.toFixed(3).padStart(6, '0');
+            return h > 0 ? h + ':' + mm + ':' + ss : mm + ':' + ss;
+        }
+        function parseTime(str) {
+            str = String(str == null ? '' : str).trim();
+            if (!str) return null;
+            const parts = str.split(':');
+            if (parts.length > 3) return null;
+            let sec = 0;
+            for (const p of parts) {
+                const v = parseFloat(p);
+                if (isNaN(v) || v < 0) return null;
+                sec = sec * 60 + v;
+            }
+            return sec;
+        }
+
+        async function openEditor(taskId) {
+            editTaskId = taskId;
+            try {
+                const resp = await fetch('/api/subtitles/' + taskId);
+                const data = await resp.json();
+                if (data.error) return fail(data.error);
+                subRows = (data.subtitles || []).map((s) => ({
+                    start: s.start, end: s.end, text: s.text
+                }));
+                if (data.style) editStyle = data.style;
+            } catch (e) {
+                return fail('字幕加载失败：' + e.message);
+            }
+            editDirty = false;
+            activeIdx = -1;
+            renderRows();
+            editVideo.src = '/api/video/' + taskId;
+            editorPanel.style.display = 'block';
+            setPhase('editing');
+            editorPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function closeEditor() {
+            editTaskId = null;
+            subRows = [];
+            editDirty = false;
+            activeIdx = -1;
+            if (editVideo) {
+                try { editVideo.pause(); } catch (e) {}
+                editVideo.removeAttribute('src');
+                editVideo.load();
+            }
+            if (subtitleOverlay) subtitleOverlay.textContent = '';
+            if (editorPanel) editorPanel.style.display = 'none';
+        }
+
+        function renderRows() {
+            subtitleList.innerHTML = '';
+            subRows.forEach((row, i) => {
+                const el = document.createElement('div');
+                el.className = 'sub-row' + (i === activeIdx ? ' active' : '');
+                el.dataset.i = i;
+                el.innerHTML =
+                    '<div class="sub-line1">' +
+                    '  <div class="sub-no">' + (i + 1) + '</div>' +
+                    '  <input class="sub-start" value="' + fmtTime(row.start) + '">' +
+                    '  <span class="sub-arrow">→</span>' +
+                    '  <input class="sub-end" value="' + fmtTime(row.end) + '">' +
+                    '  <div class="sub-tools">' +
+                    '    <button type="button" class="mini-btn" data-act="locate" title="跳到这句">定位</button>' +
+                    '    <button type="button" class="mini-btn" data-act="setstart" title="把开始设为当前播放位置">设起点</button>' +
+                    '    <button type="button" class="mini-btn" data-act="setend" title="把结束设为当前播放位置">设终点</button>' +
+                    '    <button type="button" class="mini-btn danger" data-act="del" title="删除这条">删</button>' +
+                    '  </div>' +
+                    '</div>' +
+                    '<textarea class="sub-text" rows="2"></textarea>';
+                el.querySelector('.sub-text').value = row.text;
+                subtitleList.appendChild(el);
+            });
+        }
+
+        // 事件委托：定位 / 设起点 / 设终点 / 删除
+        subtitleList.addEventListener('click', (e) => {
+            const btn = e.target.closest('button[data-act]');
+            if (!btn) return;
+            const rowEl = btn.closest('.sub-row');
+            const i = Number(rowEl.dataset.i);
+            const t = editVideo.currentTime || 0;
+            if (btn.dataset.act === 'locate') {
+                syncRowFromInputs(rowEl, i);
+                editVideo.currentTime = subRows[i].start;
+                editVideo.play().catch(() => {});
+            } else if (btn.dataset.act === 'setstart') {
+                subRows[i].start = Math.round(t * 1000) / 1000;
+                if (subRows[i].end <= subRows[i].start) subRows[i].end = subRows[i].start + 1;
+                rowEl.querySelector('.sub-start').value = fmtTime(subRows[i].start);
+                rowEl.querySelector('.sub-end').value = fmtTime(subRows[i].end);
+                markDirty();
+            } else if (btn.dataset.act === 'setend') {
+                subRows[i].end = Math.round(t * 1000) / 1000;
+                if (subRows[i].end <= subRows[i].start) subRows[i].start = Math.max(0, subRows[i].end - 1);
+                rowEl.querySelector('.sub-start').value = fmtTime(subRows[i].start);
+                rowEl.querySelector('.sub-end').value = fmtTime(subRows[i].end);
+                markDirty();
+            } else if (btn.dataset.act === 'del') {
+                subRows.splice(i, 1);
+                renderRows();
+                markDirty();
+            }
+        });
+
+        // 文本 / 时间输入改动 -> 更新数据源
+        subtitleList.addEventListener('input', (e) => {
+            const rowEl = e.target.closest('.sub-row');
+            if (!rowEl) return;
+            syncRowFromInputs(rowEl, Number(rowEl.dataset.i));
+        });
+
+        function syncRowFromInputs(rowEl, i) {
+            if (i == null || !subRows[i]) return;
+            const s = parseTime(rowEl.querySelector('.sub-start').value);
+            const en = parseTime(rowEl.querySelector('.sub-end').value);
+            rowEl.classList.toggle('invalid', s == null || en == null || s >= en);
+            if (s != null && en != null && s < en) {
+                subRows[i].start = s;
+                subRows[i].end = en;
+                markDirty();
+            }
+            const txt = rowEl.querySelector('.sub-text');
+            if (txt.value !== subRows[i].text) {
+                subRows[i].text = txt.value;
+                markDirty();
+                if (i === activeIdx) updateOverlay();
+            }
+        }
+
+        function markDirty() { editDirty = true; }
+
+        // 在当前播放位置插入一条新字幕
+        addHereBtn.addEventListener('click', () => {
+            const t = editVideo.currentTime || 0;
+            subRows.push({ start: Math.round(t * 1000) / 1000, end: Math.round(t * 1000) / 1000 + 2, text: '' });
+            subRows.sort((a, b) => a.start - b.start);
+            renderRows();
+            markDirty();
+            const last = subtitleList.querySelector('.sub-row:last-child .sub-text');
+            if (last) { last.focus(); last.scrollIntoView({ block: 'center' }); }
+        });
+
+        // 播放同步：当前句高亮 + 画面下方字幕预览 + 时间显示
+        editVideo.addEventListener('timeupdate', () => {
+            const t = editVideo.currentTime || 0;
+            videoTime.textContent = fmtTime(Math.round(t * 10) / 10).replace(/\.\d+$/, '');
+            let idx = -1;
+            for (let i = 0; i < subRows.length; i++) {
+                if (t >= subRows[i].start && t < subRows[i].end) { idx = i; break; }
+            }
+            if (idx !== activeIdx) {
+                activeIdx = idx;
+                subtitleList.querySelectorAll('.sub-row').forEach((el) => {
+                    const on = Number(el.dataset.i) === idx;
+                    el.classList.toggle('active', on);
+                    if (on) el.scrollIntoView({ block: 'nearest' });
+                });
+            }
+            updateOverlay();
+        });
+
+        // 预览字幕样式与烧录效果对齐（字号按视频高度等比缩放，颜色/描边同配置）
+        function updateOverlay() {
+            if (activeIdx < 0 || !subRows[activeIdx]) {
+                subtitleOverlay.textContent = '';
+                return;
+            }
+            const text = (subRows[activeIdx].text || '').trim();
+            if (!text) { subtitleOverlay.textContent = ''; return; }
+            const naturalH = editVideo.videoHeight || 360;
+            const scale = (videoBox.clientHeight || 240) / naturalH;
+            const font = Math.max(10, Math.round((editStyle.font_size || 32) * scale));
+            subtitleOverlay.style.fontSize = font + 'px';
+            subtitleOverlay.style.color = editStyle.text_color || '#FFFFFF';
+            subtitleOverlay.style.webkitTextStrokeWidth = Math.max(1, Math.round(font * 0.05)) + 'px';
+            subtitleOverlay.style.webkitTextStrokeColor = editStyle.outline_color || '#000000';
+            subtitleOverlay.textContent = text;
+        }
+        editVideo.addEventListener('loadedmetadata', updateOverlay);
+
+        // 收集全部行 -> 数组；非法时间返回 null 并标记错误行
+        function collectRows() {
+            const out = [];
+            let bad = null;
+            subtitleList.querySelectorAll('.sub-row').forEach((el) => {
+                const i = Number(el.dataset.i);
+                const s = parseTime(el.querySelector('.sub-start').value);
+                const en = parseTime(el.querySelector('.sub-end').value);
+                if (s == null || en == null || s < 0 || s >= en) {
+                    el.classList.add('invalid');
+                    if (bad == null) bad = i + 1;
+                    return;
+                }
+                el.classList.remove('invalid');
+                out.push({ start: s, end: en, text: (el.querySelector('.sub-text').value || '').trim() });
+            });
+            if (bad != null) {
+                showError('第 ' + bad + ' 条字幕时间无效：需 0 ≤ 开始 < 结束（格式如 01:05.250）');
+                return null;
+            }
+            if (!out.some((r) => r.text)) {
+                showError('至少需要一条非空字幕');
+                return null;
+            }
+            return out;
+        }
+
+        async function saveEdit() {
+            const rows = collectRows();
+            if (!rows) return false;
+            try {
+                const resp = await fetch('/api/subtitles/' + editTaskId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ subtitles: rows })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || '保存失败');
+                subRows = data.count === rows.length ? rows : rows; // 服务端可能丢弃空文本条目
+                editDirty = false;
+                showInfo('字幕已保存（' + data.count + ' 条）。');
+                return true;
+            } catch (e) {
+                showError('保存失败：' + e.message);
+                return false;
+            }
+        }
+
+        async function confirmEdit(skipSave) {
+            const taskId = editTaskId;
+            if (!taskId) return;
+            // 有未保存改动且非跳过模式 -> 先保存
+            if (!skipSave && editDirty) {
+                const ok = await saveEdit();
+                if (!ok) return; // 保存失败则停留在编辑器
+            }
+            try {
+                const resp = await fetch('/api/confirm/' + taskId, { method: 'POST' });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || '确认失败');
+            } catch (e) {
+                showError('确认失败：' + e.message);
+                return;
+            }
+            closeEditor();
+            hideNotice();
+            setProgress(50, '校对完成，正在烧录字幕');
+            pollStatus(taskId);
+        }
+
+        confirmEditBtn.addEventListener('click', () => confirmEdit(false));
+        saveEditBtn.addEventListener('click', () => saveEdit());
+        skipEditBtn.addEventListener('click', () => {
+            if (editDirty && !confirm('有未保存的修改，跳过校对将按上次保存的字幕烧录。继续？')) return;
+            confirmEdit(true);
+        });
 
         function success(url) {
             downloadLink.href = url;

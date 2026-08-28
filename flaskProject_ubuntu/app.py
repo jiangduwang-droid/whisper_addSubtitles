@@ -15,7 +15,9 @@ import shutil
 import threading
 import time
 import uuid
+from datetime import timedelta
 
+import srt
 from flask import Flask, jsonify, render_template, request, send_from_directory, url_for
 
 from addSubtitles import RealizeAddSubtitles
@@ -33,6 +35,12 @@ VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.flv')
 # 任务结果保留时长（秒），超过后由清理线程删除
 TASK_RETENTION_SECONDS = 24 * 3600
 CLEANUP_INTERVAL_SECONDS = 1800
+# 等待人工校对的超时（秒）：转写完成后暂停在这里，用户确认或超时后继续烧录。
+# 超时按「当前字幕原样继续」，避免已完成的转写被浪费。
+EDIT_WAIT_TIMEOUT = float(os.environ.get('EDIT_WAIT_TIMEOUT', '7200'))
+# 校对接口的输入上限，防御异常客户端
+MAX_SUBTITLE_COUNT = 3000
+MAX_SUBTITLE_TEXT = 500
 
 app = Flask(__name__)
 app.config['UPLOAD_DIR'] = UPLOAD_DIR
@@ -57,10 +65,13 @@ class Task:
         self.out_path = out_path
         self.src_name = src_name
         self.folder = os.path.dirname(src_path)
-        self.stage = 'pending'      # pending/uploaded/transcribing/burning/done/failed
+        self.stage = 'pending'      # pending/uploaded/transcribing/awaiting_edit/burning/done/failed
         self.progress = 0           # 0-100
         self.message = '排队中'
         self.error = None
+        self.srt_path = None                  # 转写产出的 srt，人工校对会原地改写
+        self.style = None                     # 字幕样式（校对预览/烧录用），upload 时填入
+        self.edit_confirmed = threading.Event()   # 人工校对完成信号，置位后流水线继续烧录
 
     _LOCK = threading.Lock()
 
@@ -205,9 +216,18 @@ def _run_pipeline(task, opts):
             progress_cb=lambda stage, pct, msg: task.update(
                 stage, 5 + int(pct * 45), msg))
         srt_path = transcribe.run_single(task.src_path)
+        task.srt_path = srt_path
 
-        # 2) 字幕烧录（ffmpeg，只重编码字幕叠加后的视频，不整片 Python 逐帧处理）
-        task.update(stage='burning', progress=50, message='语音识别完成，正在烧录字幕')
+        # 2) 人工校对：转写完成后暂停流水线，等待用户在页面上编辑字幕
+        #    （调整时间轴/文本，与画面对齐），点击「确认」后继续烧录。
+        #    超时未确认则按当前字幕原样继续，避免已完成的转写被浪费。
+        task.update(stage='awaiting_edit', progress=48,
+                    message='字幕已生成，请校对时间轴与文本')
+        if not task.edit_confirmed.wait(EDIT_WAIT_TIMEOUT):
+            task.update(message='校对超时，按当前字幕继续')
+
+        # 3) 字幕烧录（ffmpeg，只重编码字幕叠加后的视频，不整片 Python 逐帧处理）
+        task.update(stage='burning', progress=50, message='校对完成，正在烧录字幕')
         burner = RealizeAddSubtitles(
             task.src_path, srt_path, out_path=task.out_path, style=opts['style'])
         # ffmpeg 子进程上报的 pct 是 0~100：映射到总进度 50%~100%
@@ -335,6 +355,7 @@ def upload():
     out_path = os.path.join(folder, out_name)
 
     task = Task(task_id, src_path, out_path, src_name)
+    task.style = opts['style']
     REGISTRY.create(task)
 
     # 兜底触发一次模型预热（若主入口未启动/被跳过，这里补上）
@@ -368,6 +389,119 @@ def download(task_id):
         return jsonify({'error': '文件不存在或尚未就绪'}), 404
     out_name = os.path.basename(task.out_path)
     return send_from_directory(task.folder, out_name, as_attachment=True)
+
+
+# ---------------------------------------------------------------------------
+# 人工校对：字幕查看 / 编辑 / 确认 / 视频预览
+# ---------------------------------------------------------------------------
+def _load_srt_subtitles(task):
+    """读取任务 srt 并解析为 srt.Subtitle 列表。"""
+    if not task.srt_path or not os.path.isfile(task.srt_path):
+        raise FileNotFoundError('字幕尚未生成')
+    with open(task.srt_path, 'r', encoding='utf-8') as f:
+        return srt.parse(f.read())
+
+
+@app.route('/api/subtitles/<task_id>', methods=['GET'])
+def get_subtitles(task_id):
+    """返回字幕列表（秒为单位的浮点数，前端直接做时间轴运算）。"""
+    task = REGISTRY.get(task_id)
+    if task is None:
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    try:
+        subs = _load_srt_subtitles(task)
+    except FileNotFoundError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:  # noqa: BLE001 - 解析失败要反馈给前端
+        return jsonify({'error': f'字幕文件解析失败：{e}'}), 500
+    return jsonify({
+        'task_id': task_id,
+        'stage': task.stage,
+        'style': task.style or {},
+        'subtitles': [{
+            'index': s.index,
+            'start': round(s.start.total_seconds(), 3),
+            'end': round(s.end.total_seconds(), 3),
+            'text': s.content.strip(),
+        } for s in subs],
+    })
+
+
+@app.route('/api/subtitles/<task_id>', methods=['PUT'])
+def put_subtitles(task_id):
+    """保存人工校对结果：严格校验后重写 srt（原地覆盖，烧录时读取的就是它）。"""
+    task = REGISTRY.get(task_id)
+    if task is None:
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    # 已确认（事件置位）后即使 stage 尚未翻转也拒绝写入，避免与烧录抢文件
+    if task.stage != 'awaiting_edit' or task.edit_confirmed.is_set():
+        return jsonify({'error': '当前阶段不能编辑字幕（请在校对页操作）'}), 409
+
+    data = request.get_json(silent=True) or {}
+    raw = data.get('subtitles')
+    if not isinstance(raw, list):
+        return jsonify({'error': '请求数据格式错误'}), 400
+    if not raw:
+        return jsonify({'error': '字幕列表不能为空'}), 400
+    if len(raw) > MAX_SUBTITLE_COUNT:
+        return jsonify({'error': f'字幕条数超过上限（{MAX_SUBTITLE_COUNT}）'}), 400
+
+    items = []
+    for i, it in enumerate(raw):
+        if not isinstance(it, dict):
+            return jsonify({'error': f'第 {i + 1} 条字幕格式错误'}), 400
+        try:
+            start = float(it.get('start'))
+            end = float(it.get('end'))
+        except (TypeError, ValueError):
+            return jsonify({'error': f'第 {i + 1} 条字幕时间格式错误'}), 400
+        text = str(it.get('text') or '').strip()
+        if not (0 <= start < end) or end > 24 * 3600:
+            return jsonify({'error': f'第 {i + 1} 条字幕时间无效（需 0 ≤ 开始 < 结束）'}), 400
+        if not text:
+            continue  # 空文本的条目直接丢弃（渲染不出来）
+        items.append((start, end, text[:MAX_SUBTITLE_TEXT]))
+
+    if not items:
+        return jsonify({'error': '字幕文本不能全部为空'}), 400
+    # 按开始时间排序并重新编号，保证时间轴单调
+    items.sort(key=lambda x: x[0])
+    subs = [srt.Subtitle(index=i + 1,
+                         start=timedelta(seconds=s),
+                         end=timedelta(seconds=e),
+                         content=t)
+            for i, (s, e, t) in enumerate(items)]
+    with open(task.srt_path, 'w', encoding='utf-8') as f:
+        f.write(srt.compose(subs))
+    # 保存动作给任务目录续命（清理线程按目录 mtime 回收）
+    try:
+        os.utime(task.folder, None)
+    except OSError:
+        pass
+    return jsonify({'ok': True, 'count': len(subs)})
+
+
+@app.route('/api/confirm/<task_id>', methods=['POST'])
+def confirm_edit(task_id):
+    """用户确认校对完成：置位信号，后台流水线从等待点继续烧录。"""
+    task = REGISTRY.get(task_id)
+    if task is None:
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    if task.stage != 'awaiting_edit':
+        return jsonify({'error': '当前阶段无需确认'}), 409
+    task.edit_confirmed.set()
+    task.update(message='已确认，准备烧录字幕')
+    return jsonify({'ok': True})
+
+
+@app.route('/api/video/<task_id>')
+def task_video(task_id):
+    """提供原始视频给校对页预览（支持 Range，可拖动进度条）。"""
+    task = REGISTRY.get(task_id)
+    if task is None or not os.path.isfile(task.src_path):
+        return jsonify({'error': '视频不存在或已过期'}), 404
+    return send_from_directory(
+        task.folder, os.path.basename(task.src_path), conditional=True)
 
 
 if __name__ == '__main__':
