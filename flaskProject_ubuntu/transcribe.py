@@ -61,17 +61,41 @@ _MODEL_LOAD_TIMEOUT = float(os.environ.get('WHISPER_MODEL_LOAD_TIMEOUT', '600'))
 os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '60')
 
 
+def _hf_hub_cache_dir():
+    """本地 HF 缓存目录（与 huggingface_hub 的解析规则一致，无需 import 它）。"""
+    root = os.environ.get('HF_HUB_CACHE')
+    if not root:
+        home = os.environ.get('HF_HOME', os.path.join(
+            os.path.expanduser('~'), '.cache', 'huggingface'))
+        root = os.path.join(home, 'hub')
+    return root
+
+
+def _model_is_cached(model_name):
+    """判断 faster-whisper 模型是否已有完整本地缓存（含 refs/main 版本指针）。
+
+    已缓存时直接走 local_files_only 加载，完全跳过 huggingface_hub 的
+    联网版本校验 —— 外网不通的服务器上，正是那次联网校验导致加载永久挂起。
+    """
+    cache_dir = os.path.join(
+        _hf_hub_cache_dir(), f'models--Systran--faster-whisper-{model_name}')
+    return os.path.isfile(os.path.join(cache_dir, 'refs', 'main'))
+
+
 def _load_model_blocking(args):
     """实际执行模型下载 + 加载（可能较慢），失败抛异常。"""
     # 延迟 import，避免非转写路径也强制拉起 ctranslate2
     from faster_whisper import WhisperModel
+    local_only = _model_is_cached(args.whisper_model)
     logging.info(f'Loading faster-whisper model {args.whisper_model} '
-                 f'device={args.device or "cpu"} compute_type={_COMPUTE_TYPE}')
+                 f'device={args.device or "cpu"} compute_type={_COMPUTE_TYPE} '
+                 f'local_files_only={local_only}')
     tic = time.time()
     model = WhisperModel(
         args.whisper_model,
         device=args.device or 'cpu',
-        compute_type=_COMPUTE_TYPE)
+        compute_type=_COMPUTE_TYPE,
+        local_files_only=local_only)
     logging.info(f'faster-whisper model loaded in {time.time() - tic:.1f} sec')
     return model
 
