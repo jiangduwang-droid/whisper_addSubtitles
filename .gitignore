@@ -1,0 +1,18 @@
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# 运行时生成的上传视频与字幕产物（保留占位 readme.md）
+**/static/upload/*
+!**/static/upload/readme.md
+
+# IDE / 系统
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db

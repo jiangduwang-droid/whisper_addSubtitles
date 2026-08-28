@@ -1,0 +1,8 @@
+flask>=2.0
+srt>=3.5.0
+opencc>=1.1.0
+# 语音转写（whisper）+ 硬件加速，按你的环境安装：
+#   CPU:  pip install openai-whisper torch torchvision torchaudio
+#   GPU: 则安装对应的 CUDA 版 torch（见 pytorch.org）
+openai-whisper
+# 烧录字幕需要系统已安装 ffmpeg（whisper 底层也依赖它），本仓库使用其命令行

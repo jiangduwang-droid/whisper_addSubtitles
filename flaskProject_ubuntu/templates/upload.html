@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>视频字幕生成</title>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='css/upload.css') }}"/>
+    <script>window.MAX_UPLOAD_BYTES = {{ max_upload_bytes }};</script>
+</head>
+<body>
+    <div class="page">
+        <div class="wrap">
+            <header class="header">
+                <div class="badge"><span class="dot"></span>AI 驱动的字幕服务</div>
+                <h1 class="title">视频<span class="gradient-text">字幕</span>生成器</h1>
+                <p class="subtitle">
+                    上传视频，自动识别语音并烧录字幕。支持中英文，无需任何设置。
+                </p>
+            </header>
+
+            <div class="card">
+                <!-- 选择文件区 -->
+                <div class="dropzone" id="dropzone">
+                    <div class="icon">
+                        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="17 8 12 3 7 8"/>
+                            <line x1="12" y1="3" x2="12" y2="15"/>
+                        </svg>
+                    </div>
+                    <div class="lead">拖拽视频到这里，或点击选择</div>
+                    <div class="hint">单个文件最大 2GB</div>
+                    <div class="formats">.mp4 · .avi · .mov · .mkv · .flv</div>
+                    <input type="file" id="fileInput" accept=".mp4,.avi,.mov,.mkv,.flv" />
+                </div>
+
+                <!-- 已选文件 -->
+                <div class="fileinfo" id="fileinfo">
+                    <div class="f-icon">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="2" y="2" width="20" height="20" rx="2.5"/>
+                            <line x1="10" y1="9" x2="14" y2="9"/>
+                            <line x1="10" y1="13" x2="14" y2="13"/>
+                            <line x1="10" y1="17" x2="12" y2="17"/>
+                        </svg>
+                    </div>
+                    <div class="f-meta">
+                        <div class="f-name" id="fileName"></div>
+                        <div class="f-size" id="fileSize"></div>
+                    </div>
+                    <button class="f-del" id="delBtn" title="移除文件" type="button">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                        </svg>
+                    </button>
+                </div>
+
+                <!-- 字幕设置 -->
+                <div class="options" id="optionsPanel">
+                    <div class="opt-group">
+                        <label>识别语言</label>
+                        <select id="optLanguage">
+                            <option value="auto">自动检测</option>
+                            <option value="zh">中文</option>
+                            <option value="en">英文</option>
+                        </select>
+                    </div>
+                    <div class="opt-group">
+                        <label>识别模型</label>
+                        <select id="optModel">
+                            <option value="base" selected>base（均衡）</option>
+                            <option value="tiny">tiny（最快）</option>
+                            <option value="small">small（较准）</option>
+                            <option value="medium">medium（更准）</option>
+                            <option value="large-v3">large-v3（最准/占内存）</option>
+                        </select>
+                    </div>
+                    <div class="opt-group">
+                        <label>字体大小</label>
+                        <input type="number" id="optFontSize" min="8" max="100" value="32" />
+                    </div>
+                    <div class="opt-group">
+                        <label>文字颜色</label>
+                        <input type="color" id="optTextColor" value="#FFFFFF" />
+                    </div>
+                    <div class="opt-group">
+                        <label>描边颜色</label>
+                        <input type="color" id="optOutlineColor" value="#000000" />
+                    </div>
+                </div>
+
+                <!-- 进度 -->
+                <div id="progressSection" style="display:none;">
+                    <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+                    <div class="status-line">
+                        <span class="msg" id="statusMsg">处理中</span>
+                        <span class="pct" id="statusPct">0%</span>
+                    </div>
+                </div>
+
+                <!-- 步骤指示 -->
+                <div class="steps" id="steps">
+                    <div class="step active" data-step="1">
+                        <div class="node">1</div>
+                        <div class="s-label">上传</div>
+                    </div>
+                    <div class="step" data-step="2">
+                        <div class="node">2</div>
+                        <div class="s-label">识别语音</div>
+                    </div>
+                    <div class="step" data-step="3">
+                        <div class="node">3</div>
+                        <div class="s-label">烧录字幕</div>
+                    </div>
+                    <div class="step" data-step="4">
+                        <div class="node">4</div>
+                        <div class="s-label">完成下载</div>
+                    </div>
+                </div>
+
+                <!-- 操作按钮 -->
+                <div class="actions">
+                    <button type="button" class="btn btn-primary" id="submitBtn" disabled>开始处理</button>
+                    <button type="button" class="btn btn-ghost" id="resetBtn">重新选择</button>
+                </div>
+
+                <!-- 下载 -->
+                <div class="download-box" id="downloadBox">
+                    <a class="download-btn" id="downloadLink" href="#" download>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="7 10 12 15 17 10"/>
+                            <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                        下载字幕视频
+                    </a>
+                </div>
+
+                <!-- 错误提示 -->
+                <div class="notice" id="notice"></div>
+            </div>
+
+            <div class="footer">语音识别 · 字幕烧录 · 全流程自动化</div>
+        </div>
+    </div>
+
+    <script>
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const fileinfo = document.getElementById('fileinfo');
+        const fileName = document.getElementById('fileName');
+        const fileSize = document.getElementById('fileSize');
+        const delBtn = document.getElementById('delBtn');
+        const submitBtn = document.getElementById('submitBtn');
+        const resetBtn = document.getElementById('resetBtn');
+        const progressSection = document.getElementById('progressSection');
+        const progressBar = document.getElementById('progressBar');
+        const statusMsg = document.getElementById('statusMsg');
+        const statusPct = document.getElementById('statusPct');
+        const downloadBox = document.getElementById('downloadBox');
+        const downloadLink = document.getElementById('downloadLink');
+        const notice = document.getElementById('notice');
+
+        let selectedFile = null;
+        let pollTimer = null;
+        let xhr = null;
+        let phase = 'idle';        // idle | ready | uploading | processing | done
+        let userCancel = false;
+
+        const STAGE_STEP = { uploaded: 1, pending: 1, transcribing: 2, burning: 3, done: 4 };
+
+        function fmtSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const units = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(1024));
+            return (bytes / Math.pow(1024, i)).toFixed(i >= 2 ? 1 : 0) + ' ' + units[i];
+        }
+
+        function selectFile(file) {
+            // 上传前本地预检大小，超限时直接提示，不发请求
+            if (window.MAX_UPLOAD_BYTES && file.size > window.MAX_UPLOAD_BYTES) {
+                showError('文件过大（' + fmtSize(file.size) + '），超过上限 ' +
+                    fmtSize(window.MAX_UPLOAD_BYTES) + '，请压缩视频后重试');
+                return;
+            }
+            selectedFile = file;
+            fileinfo.classList.add('show');
+            fileName.textContent = file.name;
+            fileSize.textContent = fmtSize(file.size);
+            dropzone.classList.add('disabled');
+            hideNotice();
+            hideDownload();
+            setPhase('ready');
+        }
+
+        function setStep(n) {
+            document.querySelectorAll('.step').forEach((el) => {
+                const s = Number(el.dataset.step);
+                el.classList.toggle('active', s === n);
+                el.classList.toggle('done', s < n);
+            });
+        }
+
+        function setProgress(pct, msg, kind) {
+            progressBar.style.width = pct + '%';
+            progressBar.classList.remove('done', 'error');
+            if (kind) progressBar.classList.add(kind);
+            statusPct.textContent = pct + '%';
+            statusMsg.textContent = msg || '';
+            statusMsg.className = 'msg' + (kind ? ' ' + kind : '');
+        }
+
+        function hideDownload() {
+            downloadBox.classList.remove('show');
+        }
+        function hideNotice() { notice.className = 'notice'; }
+        function showError(msg) { notice.className = 'notice error'; notice.textContent = msg; }
+        function showInfo(msg) { notice.className = 'notice info'; notice.textContent = msg; }
+
+        function setPhase(p) {
+            phase = p;
+            const active = (p === 'uploading' || p === 'processing');
+            submitBtn.disabled = !selectedFile || active || p === 'done';
+            resetBtn.textContent = p === 'uploading' ? '取消上传'
+                : (p === 'processing' ? '重新上传' : '重新选择');
+            // 处理期间锁定设置，避免改动不生效造成困惑
+            document.querySelectorAll('#optionsPanel select, #optionsPanel input')
+                .forEach((el) => { el.disabled = active; });
+        }
+
+        // 取消当前上传 / 停止轮询，并回到初始「未选择」状态
+        function cancelAll() {
+            userCancel = true;
+            if (xhr) { try { xhr.abort(); } catch (e) {} xhr = null; }
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+            selectedFile = null;
+            fileInput.value = '';
+            fileinfo.classList.remove('show');
+            dropzone.classList.remove('disabled');
+            progressSection.style.display = 'none';
+            setStep(1);
+            hideDownload();
+            hideNotice();
+            setPhase('idle');
+        }
+
+        // 选择 / 拖拽
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length) selectFile(fileInput.files[0]);
+        });
+        delBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            cancelAll();
+        });
+        resetBtn.addEventListener('click', () => {
+            cancelAll();
+        });
+
+        ['dragenter', 'dragover'].forEach((t) =>
+            dropzone.addEventListener(t, (e) => {
+                e.preventDefault();
+                if (phase !== 'uploading' && phase !== 'processing' && !selectedFile) {
+                    dropzone.classList.add('dragover');
+                }
+            })
+        );
+        ['dragleave', 'drop'].forEach((t) =>
+            dropzone.addEventListener(t, (e) => {
+                e.preventDefault();
+                dropzone.classList.remove('dragover');
+            })
+        );
+        dropzone.addEventListener('drop', (e) => {
+            if (phase === 'uploading' || phase === 'processing') return;
+            const f = e.dataTransfer.files && e.dataTransfer.files[0];
+            if (f) selectFile(f);
+        });
+
+        // 上传
+        submitBtn.addEventListener('click', () => {
+            if (!selectedFile || phase === 'uploading' || phase === 'processing') return;
+            userCancel = false;
+            setPhase('uploading');
+            hideDownload();
+            hideNotice();
+            progressSection.style.display = 'block';
+            setStep(1);
+            setProgress(0, '正在上传...');
+
+            xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/upload', true);
+
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) {
+                    const pct = Math.round((e.loaded / e.total) * 100);
+                    setProgress(pct, `正在上传 ${pct}%`);
+                }
+            });
+
+            xhr.addEventListener('load', () => {
+                try {
+                    const resp = JSON.parse(xhr.responseText);
+                    if (xhr.status !== 200) throw new Error(resp.error || '上传失败');
+                    setProgress(0, '上传完成，准备处理...');
+                    pollStatus(resp.task_id);
+                } catch (err) {
+                    fail(err.message);
+                }
+            });
+            xhr.addEventListener('error', () => {
+                // 413 时服务端会立即关闭连接，可能读到状态码也可能读到 0
+                if (xhr.status === 413) {
+                    fail('文件超过大小限制，请压缩视频后重试');
+                } else {
+                    fail('网络错误，请重试');
+                }
+            });
+            xhr.addEventListener('abort', () => {
+                // 用户主动取消时静默返回；异常中止才提示
+                if (!userCancel) fail('上传已取消');
+            });
+
+            const fd = new FormData();
+            fd.append('file', selectedFile);
+            // 附带字幕设置
+            fd.append('language', document.getElementById('optLanguage').value);
+            fd.append('model', document.getElementById('optModel').value);
+            fd.append('font_size', document.getElementById('optFontSize').value);
+            fd.append('text_color', document.getElementById('optTextColor').value);
+            fd.append('outline_color', document.getElementById('optOutlineColor').value);
+            xhr.send(fd);
+        });
+
+        function pollStatus(taskId) {
+            if (pollTimer) clearInterval(pollTimer);
+            setPhase('processing');
+            pollTimer = setInterval(async () => {
+                try {
+                    const resp = await fetch('/api/status/' + taskId);
+                    const data = await resp.json();
+                    if (data.error) return fail(data.error);
+
+                    const step = STAGE_STEP[data.stage] || 1;
+                    setStep(step);
+
+                    if (data.stage === 'done') {
+                        clearInterval(pollTimer);
+                        pollTimer = null;
+                        setProgress(100, '处理完成！', 'done');
+                        success(data.download_url);
+                    } else if (data.stage === 'failed') {
+                        clearInterval(pollTimer);
+                        pollTimer = null;
+                        fail(data.error || '处理失败');
+                    } else {
+                        // 后端 progress 仅在转写/烧录阶段有意义
+                        if (data.stage === 'transcribing' || data.stage === 'burning') {
+                            setProgress(data.progress, data.message || data.stage);
+                        }
+                    }
+                } catch (e) {
+                    // 轮询临时异常忽略，下一次重试
+                }
+            }, 1000);
+        }
+
+        function success(url) {
+            downloadLink.href = url;
+            downloadBox.classList.add('show');
+            setPhase('done');
+            showInfo('处理完成，点击下方按钮下载。');
+        }
+
+        function fail(msg) {
+            if (pollTimer) clearInterval(pollTimer);
+            pollTimer = null;
+            setProgress(100, msg, 'error');
+            setPhase('ready');
+            showError('出错：' + msg);
+        }
+    </script>
+</body>
+</html>

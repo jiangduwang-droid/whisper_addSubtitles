@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>add_subtitles</title>
+	<link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='css/upload.css') }}"/>
+</head>
+<body>
+	<div id="root">
+		<div id="thewall">
+			<div id="row1">
+				<span class="row1s" id="row1_col2" style="text-align:center;display:block;">给你的视频增加字幕</span>
+			</div>
+			<div id="row3">
+				<form id="uploadForm">
+					<div class="file-wraps">
+						上传文件
+						<input type="file" id="fileInput" accept=".mp4,.avi,.mov,.mkv,.flv" />
+					</div>
+					<div class="file-wraps">
+						<progress id="progress" value="0" max="100"></progress>
+						<span id="progressValue">0%</span>
+						<span id="statusText" style="margin-left:8px;"></span>
+					</div>
+					<div class="file-wraps">
+						<button type="button" id="submitBtn" disabled>开始处理</button>
+					</div>
+					<div id="downloadBox" style="margin-top:12px;display:none;">
+						<a id="downloadLink" href="#">下载生成的字幕视频</a>
+					</div>
+				</form>
+			</div>
+			<div id="row4">
+				<div id="label_team">制作人：</div>
+			</div>
+		</div>
+	</div>
+
+	<script>
+		const fileInput = document.getElementById('fileInput');
+		const submitBtn = document.getElementById('submitBtn');
+		const progress = document.getElementById('progress');
+		const progressValue = document.getElementById('progressValue');
+		const statusText = document.getElementById('statusText');
+		const downloadBox = document.getElementById('downloadBox');
+		const downloadLink = document.getElementById('downloadLink');
+
+		let selectedFile = null;
+		let pollTimer = null;
+
+		fileInput.addEventListener('change', () => {
+			selectedFile = fileInput.files[0];
+			submitBtn.disabled = !selectedFile;
+			if (selectedFile) {
+				statusText.textContent = `已选择：${selectedFile.name}`;
+			}
+		});
+
+		submitBtn.addEventListener('click', () => {
+			if (!selectedFile) return;
+			submitBtn.disabled = true;
+			fileInput.disabled = true;
+			downloadBox.style.display = 'none';
+			setProgress(0);
+			statusText.textContent = '正在上传...';
+
+			// 用 XHR 走真实的上传进度，不再用 FileReader.readAsDataURL
+			// （后者会把整个大视频读进内存转 base64，大文件直接卡死浏览器）
+			const xhr = new XMLHttpRequest();
+			xhr.open('POST', '/api/upload', true);
+
+			xhr.upload.addEventListener('progress', (e) => {
+				if (e.lengthComputable) {
+					const pct = Math.round((e.loaded / e.total) * 100);
+					setProgress(pct);
+					statusText.textContent = `正在上传 ${pct}%`;
+				}
+			});
+
+			xhr.addEventListener('load', () => {
+				try {
+					const resp = JSON.parse(xhr.responseText);
+					if (xhr.status !== 200) throw new Error(resp.error || '上传失败');
+					statusText.textContent = '上传完成，后台开始处理...';
+					pollStatus(resp.task_id);
+				} catch (err) {
+					finishError(err.message);
+				}
+			});
+
+			xhr.addEventListener('error', () => finishError('网络错误'));
+			xhr.addEventListener('abort', () => finishError('上传已取消'));
+
+			const fd = new FormData();
+			fd.append('file', selectedFile);
+			xhr.send(fd);
+		});
+
+		function pollStatus(taskId) {
+			if (pollTimer) clearInterval(pollTimer);
+			pollTimer = setInterval(async () => {
+				try {
+					const resp = await fetch(`/api/status/${taskId}`);
+					const data = await resp.json();
+					if (data.error) return finishError(data.error);
+					setProgress(data.progress);
+					statusText.textContent = data.message || data.stage;
+					if (data.stage === 'done') {
+						clearInterval(pollTimer);
+						finishSuccess(data.download_url);
+					} else if (data.stage === 'failed') {
+						clearInterval(pollTimer);
+						finishError(data.error || '处理失败');
+					}
+				} catch (e) {
+					// 轮询期间的临时网络异常可忽略，下次再试
+				}
+			}, 1000);
+		}
+
+		function setProgress(v) {
+			progress.value = v;
+			progressValue.textContent = v + '%';
+		}
+
+		function reset() {
+			submitBtn.disabled = true;
+			fileInput.disabled = false;
+			fileInput.value = '';
+			selectedFile = null;
+			if (pollTimer) clearInterval(pollTimer);
+		}
+
+		function finishSuccess(url) {
+			downloadBox.style.display = 'block';
+			downloadLink.href = url;
+			statusText.textContent = '处理完成！';
+			reset();
+		}
+
+		function finishError(msg) {
+			statusText.textContent = '出错：' + msg;
+			reset();
+		}
+	</script>
+</body>
+</html>
