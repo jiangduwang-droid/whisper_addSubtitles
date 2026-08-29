@@ -8,10 +8,12 @@
 """
 
 import glob
+import json as _json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -20,7 +22,7 @@ from datetime import timedelta
 import srt
 from flask import Flask, jsonify, render_template, request, send_from_directory, url_for
 
-from addSubtitles import RealizeAddSubtitles
+from addSubtitles import FFMPEG, RealizeAddSubtitles
 from transcribe import TranscribeArgs, Transcribe
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -41,6 +43,10 @@ EDIT_WAIT_TIMEOUT = float(os.environ.get('EDIT_WAIT_TIMEOUT', '7200'))
 # 校对接口的输入上限，防御异常客户端
 MAX_SUBTITLE_COUNT = 3000
 MAX_SUBTITLE_TEXT = 500
+# 校对页预览视频的转码超时（秒）：超时则回退用原始视频
+PREVIEW_TRANSCODE_TIMEOUT = int(os.environ.get('PREVIEW_TRANSCODE_TIMEOUT', '1800'))
+# ffprobe 与 ffmpeg 同目录约定（FFMPEG_BIN 指定完整路径时同样适用）
+FFPROBE = os.environ.get('FFPROBE_BIN') or FFMPEG.replace('ffmpeg', 'ffprobe')
 
 app = Flask(__name__)
 app.config['UPLOAD_DIR'] = UPLOAD_DIR
@@ -72,6 +78,9 @@ class Task:
         self.srt_path = None                  # 转写产出的 srt，人工校对会原地改写
         self.style = None                     # 字幕样式（校对预览/烧录用），upload 时填入
         self.edit_confirmed = threading.Event()   # 人工校对完成信号，置位后流水线继续烧录
+        # 校对页预览视频：none / generating / ready / failed
+        self.preview_path = None
+        self.preview_state = 'none'
 
     _LOCK = threading.Lock()
 
@@ -223,6 +232,9 @@ def _run_pipeline(task, opts):
         #    超时未确认则按当前字幕原样继续，避免已完成的转写被浪费。
         task.update(stage='awaiting_edit', progress=48,
                     message='字幕已生成，请校对时间轴与文本')
+        # 后台生成浏览器可流畅播放的预览副本（源视频编码不兼容时必须转码）
+        threading.Thread(target=_generate_preview, args=(task,), daemon=True,
+                         name=f'preview-{task.id[:8]}').start()
         if not task.edit_confirmed.wait(EDIT_WAIT_TIMEOUT):
             task.update(message='校对超时，按当前字幕继续')
 
@@ -250,6 +262,115 @@ def _run_pipeline(task, opts):
 
 def _dispatch_pipeline(task, opts):
     threading.Thread(target=_run_pipeline, args=(task, opts), daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# 校对页预览视频：浏览器兼容副本
+#
+# 直接把原始视频给 <video> 常见两类问题：
+# 1. 编码不兼容（HEVC/H.265、10bit、MKV/AVI 容器等）—— 浏览器只解得出
+#    声音、画面黑屏，即用户反馈的「只有声音」；
+# 2. MP4 的 moov 索引在文件尾（无 faststart）+ 文件大 —— 播放器要等
+#    索引才能起播/拖动，表现为长时间转圈、卡顿。
+# 解决：探测编码，能直用就直用/快速重封装，否则后台转码出 H.264+AAC
+# 的 720p 预览副本（+faststart），前端轮询就绪后再播放。
+# ---------------------------------------------------------------------------
+def _probe_video(path):
+    """ffprobe 探测视频编码信息；失败返回 None。"""
+    try:
+        proc = subprocess.run(
+            [FFPROBE, '-v', 'error', '-print_format', 'json',
+             '-show_streams', '-show_format', path],
+            capture_output=True, text=True, timeout=120)
+        info = _json.loads(proc.stdout or '{}')
+    except Exception:  # noqa: BLE001 - 探测失败按不兼容处理
+        return None
+    v = next((s for s in info.get('streams', [])
+              if s.get('codec_type') == 'video'), None)
+    a = next((s for s in info.get('streams', [])
+              if s.get('codec_type') == 'audio'), None)
+    if not v:
+        return None
+    try:
+        height = int(v.get('height') or 0)
+    except (TypeError, ValueError):
+        height = 0
+    return {
+        'vcodec': v.get('codec_name'),
+        'pix_fmt': v.get('pix_fmt'),
+        'height': height,
+        'acodec': a.get('codec_name') if a else None,
+    }
+
+
+def _has_faststart(path):
+    """检查 MP4 的 moov 索引是否在文件头（faststart）。
+
+    moov 在 mdat 之后时，浏览器必须先摸到文件尾才能起播/拖动 ——
+    大文件经 HTTP 播放就会表现为卡顿。读头部 256KB 足够判断。
+    """
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(256 * 1024)
+    except OSError:
+        return True  # 读不了就不折腾，按可用处理
+    i_moov, i_mdat = head.find(b'moov'), head.find(b'mdat')
+    if i_moov == -1 and i_mdat == -1:
+        return True  # 头部都未见索引，交给转码分支兜底
+    if i_mdat == -1:
+        return True
+    if i_moov == -1:
+        return False
+    return i_moov < i_mdat
+
+
+def _is_browser_friendly(info, ext):
+    """源视频是否能被主流浏览器直接解码播放。"""
+    return (info is not None
+            and ext in ('.mp4', '.m4v')
+            and info['vcodec'] == 'h264'
+            and info['pix_fmt'] in ('yuv420p', 'yuvj420p')
+            and info['acodec'] in ('aac', 'mp3', None)
+            and info['height'] > 0)
+
+
+def _generate_preview(task):
+    """生成校对页预览副本（后台线程）。状态写入 task.preview_state。"""
+    out_path = os.path.join(task.folder, 'preview.mp4')
+    task.preview_state = 'generating'
+    src_ext = os.path.splitext(task.src_path)[1].lower()
+    try:
+        info = _probe_video(task.src_path)
+        if (_is_browser_friendly(info, src_ext)
+                and info['height'] <= 1080
+                and _has_faststart(task.src_path)):
+            # 已是浏览器友好且索引在头部：直接用原片，零等待
+            task.preview_path = task.src_path
+            task.preview_state = 'ready'
+            logging.getLogger(__name__).info(
+                f'preview: {task.id} 直接使用原片（h264/aac, faststart）')
+            return
+        if _is_browser_friendly(info, src_ext):
+            # 编码可播但缺 faststart：流拷贝重封装，秒级完成
+            cmd = [FFMPEG, '-y', '-loglevel', 'error', '-i', task.src_path,
+                   '-c', 'copy', '-movflags', '+faststart', out_path]
+        else:
+            # 编码不兼容（HEVC/MKV/AVI/10bit 等）：转码 H.264+AAC，最高 720p
+            cmd = [FFMPEG, '-y', '-loglevel', 'error', '-i', task.src_path,
+                   '-vf', "scale=-2:'min(720,ih)'",
+                   '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                   '-pix_fmt', 'yuv420p',
+                   '-c:a', 'aac', '-b:a', '128k',
+                   '-movflags', '+faststart', out_path]
+        subprocess.run(cmd, check=True, timeout=PREVIEW_TRANSCODE_TIMEOUT)
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError('预览视频未生成')
+        task.preview_path = out_path
+        task.preview_state = 'ready'
+    except Exception as e:  # noqa: BLE001 - 预览失败不阻断校对，回退原片
+        task.preview_state = 'failed'
+        logging.getLogger(__name__).warning(
+            f'preview: {task.id} 生成失败（前端将回退原始视频）：{e}')
 
 
 def _warmup_model():
@@ -502,6 +623,33 @@ def task_video(task_id):
         return jsonify({'error': '视频不存在或已过期'}), 404
     return send_from_directory(
         task.folder, os.path.basename(task.src_path), conditional=True)
+
+
+@app.route('/api/preview/<task_id>')
+def preview_status(task_id):
+    """预览副本生成状态：none/generating/ready/failed。"""
+    task = REGISTRY.get(task_id)
+    if task is None:
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    return jsonify({
+        'task_id': task_id,
+        'state': task.preview_state,
+        'url': f'/api/preview/{task_id}/file'
+        if task.preview_state == 'ready' else None,
+    })
+
+
+@app.route('/api/preview/<task_id>/file')
+def preview_file(task_id):
+    """预览视频文件（浏览器兼容副本；支持 Range）。"""
+    task = REGISTRY.get(task_id)
+    if (task is None or task.preview_state != 'ready'
+            or not task.preview_path or not os.path.isfile(task.preview_path)):
+        return jsonify({'error': '预览尚未就绪'}), 404
+    return send_from_directory(
+        os.path.dirname(task.preview_path),
+        os.path.basename(task.preview_path),
+        conditional=True, mimetype='video/mp4')
 
 
 if __name__ == '__main__':

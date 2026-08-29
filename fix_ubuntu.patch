@@ -1,0 +1,258 @@
+--- whisper_addSubtitles/flaskProject_ubuntu/app.py	2026-08-28 11:41:45.572480151 +0000
++++ /workspace/whisper_addSubtitles-fixed/flaskProject_ubuntu/app.py	2026-08-28 11:58:55.064207405 +0000
+@@ -8,6 +8,7 @@
+ """
+ 
+ import glob
++import logging
+ import os
+ import re
+ import shutil
+@@ -187,24 +188,31 @@
+     """在后台线程中执行：语音转写 -> 烧录字幕 -> 产出最终视频。"""
+     try:
+         # 1) 语音转写
+-        task.update(stage='transcribing', progress=5, message='正在识别语音(可能较慢)')
++        # 注：首次使用某个模型时需要联网下载，可能耗时数分钟。
++        task.update(stage='transcribing', progress=5,
++                    message='正在加载语音识别模型(首次运行需下载，可能较慢)')
+         transcribe_args = TranscribeArgs(
+             lang=opts['lang'],
+             whisper_model=opts['model'],
+             vad=TRANSCRIBE_OPTS.vad,
+             device=TRANSCRIBE_OPTS.device,
+             delay_seconds=TRANSCRIBE_OPTS.delay_seconds)
++        # 转写子模块上报的 pct 是 0~1 的小数：映射到总进度 5%~50%。
++        # （原实现写成 int(pct * 0.45)，对 0~1 的小数取整恒为 0，
++        #   导致转写全程进度永远停在 5% —— 这就是"卡在5%"的显示层根因。）
+         transcribe = Transcribe(
+             transcribe_args,
+-            progress_cb=lambda stage, pct, msg: task.update(stage, 5 + int(pct * 0.45), msg))
++            progress_cb=lambda stage, pct, msg: task.update(
++                stage, 5 + int(pct * 45), msg))
+         srt_path = transcribe.run_single(task.src_path)
+ 
+         # 2) 字幕烧录（ffmpeg，只重编码字幕叠加后的视频，不整片 Python 逐帧处理）
+-        task.update(stage='burning', progress=55, message='正在烧录字幕')
++        task.update(stage='burning', progress=50, message='语音识别完成，正在烧录字幕')
+         burner = RealizeAddSubtitles(
+             task.src_path, srt_path, out_path=task.out_path, style=opts['style'])
++        # ffmpeg 子进程上报的 pct 是 0~100：映射到总进度 50%~100%
+         burner.burn(progress_cb=lambda pct: task.update(
+-            stage='burning', progress=55 + int(pct * 0.45),
++            stage='burning', progress=50 + int(pct * 0.5),
+             message=f'正在烧录字幕 {pct:.0f}%'))
+ 
+         if not os.path.isfile(task.out_path) or os.path.getsize(task.out_path) == 0:
+@@ -224,6 +232,39 @@
+     threading.Thread(target=_run_pipeline, args=(task, opts), daemon=True).start()
+ 
+ 
++def _warmup_model():
++    """启动时后台预热默认模型：把「首次下载/加载」的成本移到服务启动阶段，
++    避免第一个用户任务长时间停在 5%（加载模型）。
++    预热失败只记日志，不影响服务启动。"""
++    model_name = (os.environ.get('WHISPER_WARMUP_MODEL')
++                  or os.environ.get('WHISPER_MODEL')
++                  or 'base')
++    try:
++        args = TranscribeArgs(whisper_model=model_name)
++        # noqa 以下 import 仅为复用 _get_model 的超时保护
++        from transcribe import _get_model
++        _get_model(args)
++        logging.getLogger(__name__).info(f'Warmup model {model_name} ready')
++    except Exception as e:  # noqa: BLE001 - 预热失败不影响服务
++        logging.getLogger(__name__).warning(
++            f'模型 {model_name} 预热失败（首个任务会再次尝试）：{e}')
++
++
++_WARMUP_ONCE_LOCK = threading.Lock()
++_warmup_started = False
++
++
++def _start_warmup():
++    """只触发一次的模型预热（python app.py 与 waitress 等 WSGI 启动方式都覆盖：
++    主入口启动时调用一次；首个上传请求时兜底再调用一次，已启动则直接返回）。"""
++    global _warmup_started
++    with _WARMUP_ONCE_LOCK:
++        if _warmup_started:
++            return
++        _warmup_started = True
++    threading.Thread(target=_warmup_model, daemon=True, name='model-warmup').start()
++
++
+ def _cleanup_loop():
+     while True:
+         time.sleep(CLEANUP_INTERVAL_SECONDS)
+@@ -280,6 +321,9 @@
+     task = Task(task_id, src_path, out_path, src_name)
+     REGISTRY.create(task)
+ 
++    # 兜底触发一次模型预热（若主入口未启动/被跳过，这里补上）
++    _start_warmup()
++
+     task.update(stage='uploaded', progress=2, message='正在保存上传文件')
+     # 分块写入磁盘，避免整个大文件长时间驻留内存
+     try:
+@@ -312,6 +356,8 @@
+ 
+ if __name__ == '__main__':
+     threading.Thread(target=_cleanup_loop, args=(), daemon=True).start()
++    # 启动时后台预热默认模型，避免第一个用户任务长时间停在「加载模型」
++    _start_warmup()
+     # 多线程并发，单次大上传不再阻塞其它请求。
+     # 端口经环境变量 PORT 可配（默认 8081）。
+     # 生产环境建议改用 waitress：`pip install waitress`，改调用 wsgi 服务器。
+--- whisper_addSubtitles/flaskProject_ubuntu/transcribe.py	2026-08-28 11:41:45.584480242 +0000
++++ /workspace/whisper_addSubtitles-fixed/flaskProject_ubuntu/transcribe.py	2026-08-28 11:57:44.435677847 +0000
+@@ -35,30 +35,94 @@
+ # ---------------------------------------------------------------------------
+ # faster-whisper（CTranslate2）引擎：CPU 上比 openai/whisper 快约 4~5 倍、
+ # 内存占用大幅降低，配合 int8 量化后 medium/large 也能在低内存服务器运行。
++#
++# 修复「任务卡在 5% 不动」的关键点：
++# 1) 模型下载（huggingface_hub）默认没有总超时，网络停滞时会无限等待 ——
++#    显式设置 HF_HUB_DOWNLOAD_TIMEOUT，让网络问题以异常形式暴露。
++# 2) 原实现把「下载+加载」放在全局锁内：一旦某次加载挂起，锁被永久持有，
++#    后续所有任务（无论什么模型）都会在锁上排队，永远停在 5%。
++#    现在改为：缓存锁只保护字典读写；加载放到子线程并带总超时，
++#    超时立即抛错，任务标记 failed 并给出可操作的提示，而不是永久挂起。
+ # ---------------------------------------------------------------------------
+-_MODEL_LOCK = threading.Lock()
++_CACHE_LOCK = threading.Lock()
+ _MODEL_CACHE = {}
++# 同一模型的并发加载互斥（不同模型互不影响）
++_LOAD_LOCKS_LOCK = threading.Lock()
++_LOAD_LOCKS = {}
+ # 最多同时驻留的模型数量：切换不同模型时防止多个模型同时占用内存
+ _MODEL_CACHE_MAX = int(os.environ.get('WHISPER_MODEL_CACHE_MAX', '2'))
+ # 量化精度：int8 最快最省内存；float32 更准但更慢。CPU 推荐 int8。
+ _COMPUTE_TYPE = os.environ.get('WHISPER_COMPUTE_TYPE', 'int8')
++# 模型加载（含首次下载）总超时（秒）：超时即失败报错，不再无限等待
++_MODEL_LOAD_TIMEOUT = float(os.environ.get('WHISPER_MODEL_LOAD_TIMEOUT', '600'))
++
++# huggingface_hub 的文件下载默认无总超时：连接停滞会永久挂起。
++# 显式给下载设置超时（秒），网络异常会正常抛错并让任务失败。
++os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '60')
++
++
++def _load_model_blocking(args):
++    """实际执行模型下载 + 加载（可能较慢），失败抛异常。"""
++    # 延迟 import，避免非转写路径也强制拉起 ctranslate2
++    from faster_whisper import WhisperModel
++    logging.info(f'Loading faster-whisper model {args.whisper_model} '
++                 f'device={args.device or "cpu"} compute_type={_COMPUTE_TYPE}')
++    tic = time.time()
++    model = WhisperModel(
++        args.whisper_model,
++        device=args.device or 'cpu',
++        compute_type=_COMPUTE_TYPE)
++    logging.info(f'faster-whisper model loaded in {time.time() - tic:.1f} sec')
++    return model
+ 
+ 
+ def _get_model(args):
+     key = (args.whisper_model, args.device)
+-    with _MODEL_LOCK:
++    with _CACHE_LOCK:
+         model = _MODEL_CACHE.get(key)
+-        if model is None:
+-            # 延迟 import，避免非转写路径也强制拉起 ctranslate2
+-            from faster_whisper import WhisperModel
+-            logging.info(f'Loading faster-whisper model {key} compute_type={_COMPUTE_TYPE}')
+-            tic = time.time()
+-            model = WhisperModel(
+-                args.whisper_model,
+-                device=args.device or 'cpu',
+-                compute_type=_COMPUTE_TYPE)
++    if model is not None:
++        return model
++
++    with _LOAD_LOCKS_LOCK:
++        key_lock = _LOAD_LOCKS.setdefault(key, threading.Lock())
++    # 同一模型的并发任务在这里排队（等待时间受 _MODEL_LOAD_TIMEOUT 约束）；
++    # 不同模型互不阻塞 —— 一个模型加载挂起不再拖死整个服务。
++    with key_lock:
++        # 双重检查：排队期间可能已被其它任务加载完成
++        with _CACHE_LOCK:
++            model = _MODEL_CACHE.get(key)
++        if model is not None:
++            return model
++
++        result = {}
++
++        def _worker():
++            try:
++                result['model'] = _load_model_blocking(args)
++            except Exception as e:  # noqa: BLE001 - 加载异常带回调用方
++                result['error'] = e
++
++        t = threading.Thread(
++            target=_worker, daemon=True, name=f'whisper-load-{args.whisper_model}')
++        t.start()
++        t.join(_MODEL_LOAD_TIMEOUT)
++
++        if t.is_alive():
++            raise RuntimeError(
++                f'语音识别模型 {args.whisper_model} 加载超时'
++                f'（超过 {int(_MODEL_LOAD_TIMEOUT)} 秒）。'
++                f'首次运行需从 {os.environ.get("HF_ENDPOINT", "https://huggingface.co")} '
++                f'下载模型，请检查服务器外网连通性后重试；'
++                f'或在服务器上手动预下载模型后重启服务：'
++                f'python -c "from faster_whisper import WhisperModel; '
++                f'WhisperModel(\'{args.whisper_model}\')"')
++        if 'error' in result:
++            raise RuntimeError(
++                f'语音识别模型 {args.whisper_model} 加载失败：{result["error"]}')
++
++        model = result['model']
++        with _CACHE_LOCK:
+             _MODEL_CACHE[key] = model
+-            logging.info(f'faster-whisper model loaded in {time.time() - tic:.1f} sec')
+             # 超出上限时淘汰最早的模型，及时释放内存
+             while len(_MODEL_CACHE) > _MODEL_CACHE_MAX:
+                 _MODEL_CACHE.pop(next(iter(_MODEL_CACHE)))
+--- whisper_addSubtitles/flaskProject_ubuntu/templates/upload.html	2026-08-28 11:41:45.584480242 +0000
++++ /workspace/whisper_addSubtitles-fixed/flaskProject_ubuntu/templates/upload.html	2026-08-28 11:59:23.516420733 +0000
+@@ -29,7 +29,7 @@
+                         </svg>
+                     </div>
+                     <div class="lead">拖拽视频到这里，或点击选择</div>
+-                    <div class="hint">单个文件最大 2GB</div>
++                    <div class="hint">单个文件最大 {{ '%g'|format(max_upload_bytes / 1073741824) }}GB</div>
+                     <div class="formats">.mp4 · .avi · .mov · .mkv · .flv</div>
+                     <input type="file" id="fileInput" accept=".mp4,.avi,.mov,.mkv,.flv" />
+                 </div>
+@@ -331,9 +331,14 @@
+             xhr.send(fd);
+         });
+ 
++        let stuckKey = null;
++        let stuckSince = 0;
++
+         function pollStatus(taskId) {
+             if (pollTimer) clearInterval(pollTimer);
+             setPhase('processing');
++            stuckKey = null;
++            stuckSince = 0;
+             pollTimer = setInterval(async () => {
+                 try {
+                     const resp = await fetch('/api/status/' + taskId);
+@@ -355,7 +360,16 @@
+                     } else {
+                         // 后端 progress 仅在转写/烧录阶段有意义
+                         if (data.stage === 'transcribing' || data.stage === 'burning') {
+-                            setProgress(data.progress, data.message || data.stage);
++                            // 进度超过 2 分钟无变化时给出提示（首次运行需下载识别模型）
++                            const key = data.stage + ':' + data.progress;
++                            const now = Date.now();
++                            if (key !== stuckKey) { stuckKey = key; stuckSince = now; }
++                            let hint = '';
++                            if (now - stuckSince > 120000) {
++                                hint = '（较长时间无新进展：首次运行需下载识别模型，'
++                                    + '请耐心等待；持续不动请联系管理员检查服务器网络）';
++                            }
++                            setProgress(data.progress, (data.message || data.stage) + hint);
+                         }
+                     }
+                 } catch (e) {

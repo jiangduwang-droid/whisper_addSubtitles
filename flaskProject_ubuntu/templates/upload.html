@@ -113,12 +113,19 @@
                     <div class="ed-body">
                         <div class="ed-video">
                             <div class="video-box" id="videoBox">
-                                <video id="editVideo" controls preload="metadata"></video>
+                                <video id="editVideo" controls preload="auto" playsinline></video>
                                 <div class="subtitle-overlay" id="subtitleOverlay"></div>
+                                <div class="preview-waiting" id="previewWaiting">
+                                    <div class="pw-spin"></div>
+                                    <div class="pw-text" id="previewWaitingText">正在准备预览视频...</div>
+                                </div>
                             </div>
                             <div class="video-ctrl">
                                 <span class="v-time" id="videoTime">00:00.0</span>
-                                <button type="button" class="mini-btn" id="addHereBtn">+ 在当前位置插入字幕</button>
+                                <div class="v-ctrl-btns">
+                                    <button type="button" class="mini-btn" id="addHereBtn" title="在当前播放位置插入一条字幕">+ 插入字幕</button>
+                                    <button type="button" class="mini-btn" id="previewFullBtn" title="全屏播放，便于逐帧对齐画面">⛶ 全屏校对</button>
+                                </div>
                             </div>
                         </div>
                         <div class="ed-list" id="subtitleList"></div>
@@ -204,10 +211,15 @@
         const subtitleOverlay = document.getElementById('subtitleOverlay');
         const videoTime = document.getElementById('videoTime');
         const addHereBtn = document.getElementById('addHereBtn');
+        const previewFullBtn = document.getElementById('previewFullBtn');
+        const previewWaiting = document.getElementById('previewWaiting');
+        const previewWaitingText = document.getElementById('previewWaitingText');
         const subtitleList = document.getElementById('subtitleList');
         const confirmEditBtn = document.getElementById('confirmEditBtn');
         const saveEditBtn = document.getElementById('saveEditBtn');
         const skipEditBtn = document.getElementById('skipEditBtn');
+        const pageCard = editorPanel.closest('.card');
+        const pageWrap = editorPanel.closest('.wrap');
 
         let selectedFile = null;
         let pollTimer = null;
@@ -221,6 +233,7 @@
         let subRows = [];          // {start, end, text} —— 渲染数据源
         let editDirty = false;
         let activeIdx = -1;
+        let previewPollToken = 0;  // 预览轮询令牌：编辑器关闭后使旧轮询失效
 
         const STAGE_STEP = { uploaded: 1, pending: 1, transcribing: 2, awaiting_edit: 3, burning: 4, done: 5 };
 
@@ -484,14 +497,21 @@
             editDirty = false;
             activeIdx = -1;
             renderRows();
-            editVideo.src = '/api/video/' + taskId;
+            // 浮层底边位置 = 烧录 MarginV 的比例（80/288 ≈ 28%），所见即所得
+            subtitleOverlay.style.bottom =
+                Math.round((ASS_MARGIN_V / ASS_PLAY_RES_Y) * 100) + '%';
+            // 编辑器打开时页面加宽，给视频预览更多空间
+            pageCard.classList.add('expanded');
+            pageWrap.classList.add('expanded');
             editorPanel.style.display = 'block';
             setPhase('editing');
             editorPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            startPreview(taskId);
         }
 
         function closeEditor() {
             editTaskId = null;
+            previewPollToken++;   // 使进行中的预览轮询失效
             subRows = [];
             editDirty = false;
             activeIdx = -1;
@@ -501,8 +521,56 @@
                 editVideo.load();
             }
             if (subtitleOverlay) subtitleOverlay.textContent = '';
+            if (previewWaiting) previewWaiting.classList.remove('show');
             if (editorPanel) editorPanel.style.display = 'none';
+            if (pageCard) pageCard.classList.remove('expanded');
+            if (pageWrap) pageWrap.classList.remove('expanded');
+            try { if (document.fullscreenElement) document.exitFullscreen(); } catch (e) {}
         }
+
+        // 预览视频：等服务器生成浏览器兼容副本（转码中）就绪后再播放
+        function startPreview(taskId) {
+            const token = ++previewPollToken;
+            showPreviewWaiting('正在准备预览视频...');
+            editVideo.removeAttribute('src');
+            const t0 = Date.now();
+            const poll = async () => {
+                if (token !== previewPollToken) return;   // 编辑器已关闭
+                try {
+                    const resp = await fetch('/api/preview/' + taskId);
+                    const data = await resp.json();
+                    if (data.error) throw new Error(data.error);
+                    if (data.state === 'ready') {
+                        hidePreviewWaiting();
+                        editVideo.src = data.url;
+                        editVideo.load();
+                        return;
+                    }
+                    if (data.state === 'failed') {
+                        // 预览生成失败：回退原始视频（编码不兼容时可能只有声音）
+                        hidePreviewWaiting();
+                        editVideo.src = '/api/video/' + taskId;
+                        editVideo.load();
+                        showInfo('预览视频生成失败，已回退原始视频；若画面无法显示'
+                            + '（仅有声音），可对照时间轴和声音进行校对。');
+                        return;
+                    }
+                    const sec = Math.round((Date.now() - t0) / 1000);
+                    showPreviewWaiting('正在准备预览视频（转换格式约需几十秒）...'
+                        + (sec > 8 ? ' 已等待 ' + sec + ' 秒' : ''));
+                } catch (e) {
+                    // 轮询异常忽略，下一轮重试
+                }
+                setTimeout(poll, 1500);
+            };
+            poll();
+        }
+
+        function showPreviewWaiting(text) {
+            previewWaitingText.textContent = text;
+            previewWaiting.classList.add('show');
+        }
+        function hidePreviewWaiting() { previewWaiting.classList.remove('show'); }
 
         function renderRows() {
             subtitleList.innerHTML = '';
@@ -616,7 +684,13 @@
             updateOverlay();
         });
 
-        // 预览字幕样式与烧录效果对齐（字号按视频高度等比缩放，颜色/描边同配置）
+        // 预览字幕样式与烧录效果对齐：
+        // ffmpeg subtitles 滤镜把 srt 转 ass 时以 PlayResY=288 为基准，
+        // FontSize/MarginV 都是相对画面高度的比例 —— 用显示高度等比换算
+        // 即可在任意预览尺寸（含全屏）下与烧录结果一致。
+        // （实测标定：font_size=32 → 字高≈画面高 11%，MarginV=80 → 底边距≈28%）
+        const ASS_PLAY_RES_Y = 288;
+        const ASS_MARGIN_V = 80;
         function updateOverlay() {
             if (activeIdx < 0 || !subRows[activeIdx]) {
                 subtitleOverlay.textContent = '';
@@ -624,16 +698,34 @@
             }
             const text = (subRows[activeIdx].text || '').trim();
             if (!text) { subtitleOverlay.textContent = ''; return; }
-            const naturalH = editVideo.videoHeight || 360;
-            const scale = (videoBox.clientHeight || 240) / naturalH;
-            const font = Math.max(10, Math.round((editStyle.font_size || 32) * scale));
+            const dispH = (editVideo.getBoundingClientRect().height
+                || editVideo.clientHeight || 240);
+            const font = Math.max(10,
+                Math.round((editStyle.font_size / ASS_PLAY_RES_Y) * dispH));
             subtitleOverlay.style.fontSize = font + 'px';
             subtitleOverlay.style.color = editStyle.text_color || '#FFFFFF';
-            subtitleOverlay.style.webkitTextStrokeWidth = Math.max(1, Math.round(font * 0.05)) + 'px';
-            subtitleOverlay.style.webkitTextStrokeColor = editStyle.outline_color || '#000000';
+            subtitleOverlay.style.webkitTextStrokeWidth =
+                Math.max(1, Math.round(font * 0.06)) + 'px';
+            subtitleOverlay.style.webkitTextStrokeColor =
+                editStyle.outline_color || '#000000';
             subtitleOverlay.textContent = text;
         }
         editVideo.addEventListener('loadedmetadata', updateOverlay);
+        window.addEventListener('resize', updateOverlay);
+        document.addEventListener('fullscreenchange', updateOverlay);
+
+        // 全屏校对：视频 + 字幕浮层一起进全屏，便于逐帧对齐
+        function toggleFullscreen() {
+            if (document.fullscreenElement) {
+                document.exitFullscreen().catch(() => {});
+            } else {
+                videoBox.requestFullscreen().catch(() => {
+                    showError('当前浏览器不支持全屏预览');
+                });
+            }
+        }
+        previewFullBtn.addEventListener('click', toggleFullscreen);
+        videoBox.addEventListener('dblclick', toggleFullscreen);
 
         // 收集全部行 -> 数组；非法时间返回 null 并标记错误行
         function collectRows() {
