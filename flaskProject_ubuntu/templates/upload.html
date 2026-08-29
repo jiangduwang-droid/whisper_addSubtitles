@@ -127,6 +127,23 @@
                                     <button type="button" class="mini-btn" id="previewFullBtn" title="全屏播放，便于逐帧对齐画面">⛶ 全屏校对</button>
                                 </div>
                             </div>
+                            <!-- 字幕位置自定义：9 宫格预设 + 拖拽微调（见 JS 注释） -->
+                            <div class="pos-ctrl" id="posCtrl">
+                                <span class="pc-label">字幕位置</span>
+                                <div class="pos-grid" id="posGrid">
+                                    <button type="button" data-x="0.15" data-y="0.15" title="左上"></button>
+                                    <button type="button" data-x="0.5" data-y="0.15" title="上中"></button>
+                                    <button type="button" data-x="0.85" data-y="0.15" title="右上"></button>
+                                    <button type="button" data-x="0.15" data-y="0.5" title="左中"></button>
+                                    <button type="button" data-x="0.5" data-y="0.5" title="正中"></button>
+                                    <button type="button" data-x="0.85" data-y="0.5" title="右中"></button>
+                                    <button type="button" data-x="0.15" data-y="0.85" title="左下"></button>
+                                    <button type="button" data-x="0.5" data-y="0.85" title="下中"></button>
+                                    <button type="button" data-x="0.85" data-y="0.85" title="右下"></button>
+                                </div>
+                                <button type="button" class="mini-btn" id="posResetBtn" title="清除自定义位置，恢复默认底部">恢复默认</button>
+                                <span class="pc-tip">选中后拖动视频里的字幕可微调，位置实时保存。拖到左/中/右区域会自动切换文字对齐方式并智能换行</span>
+                            </div>
                         </div>
                         <div class="ed-list" id="subtitleList"></div>
                     </div>
@@ -215,6 +232,8 @@
         const previewWaiting = document.getElementById('previewWaiting');
         const previewWaitingText = document.getElementById('previewWaitingText');
         const subtitleList = document.getElementById('subtitleList');
+        const posGrid = document.getElementById('posGrid');
+        const posResetBtn = document.getElementById('posResetBtn');
         const confirmEditBtn = document.getElementById('confirmEditBtn');
         const saveEditBtn = document.getElementById('saveEditBtn');
         const skipEditBtn = document.getElementById('skipEditBtn');
@@ -234,6 +253,7 @@
         let editDirty = false;
         let activeIdx = -1;
         let previewPollToken = 0;  // 预览轮询令牌：编辑器关闭后使旧轮询失效
+        let editPos = null;        // 自定义字幕位置 {x, y}（0~1，文本块中心比例）；null=默认底部
 
         const STAGE_STEP = { uploaded: 1, pending: 1, transcribing: 2, awaiting_edit: 3, burning: 4, done: 5 };
 
@@ -497,9 +517,14 @@
             editDirty = false;
             activeIdx = -1;
             renderRows();
-            // 浮层底边位置 = 烧录 MarginV 的比例（80/288 ≈ 28%），所见即所得
-            subtitleOverlay.style.bottom =
-                Math.round((ASS_MARGIN_V / ASS_PLAY_RES_Y) * 100) + '%';
+            // 自定义位置：从已保存样式恢复（null = 默认底部，与烧录 MarginV 一致）
+            editPos = (data.style && data.style.pos_x != null
+                && data.style.pos_y != null)
+                ? { x: data.style.pos_x, y: data.style.pos_y }
+                : null;
+            applyOverlayPosition();
+            highlightPosPreset();
+            videoBox.classList.add('edit-live');   // 开启字幕拖拽
             // 编辑器打开时页面加宽，给视频预览更多空间
             pageCard.classList.add('expanded');
             pageWrap.classList.add('expanded');
@@ -521,6 +546,10 @@
                 editVideo.load();
             }
             if (subtitleOverlay) subtitleOverlay.textContent = '';
+            if (subtitleOverlay) subtitleOverlay.classList.remove('ghost', 'dragging');
+            if (videoBox) videoBox.classList.remove('edit-live');
+            editPos = null;
+            applyOverlayPosition();   // 复位到默认底部布局
             if (previewWaiting) previewWaiting.classList.remove('show');
             if (editorPanel) editorPanel.style.display = 'none';
             if (pageCard) pageCard.classList.remove('expanded');
@@ -694,10 +723,16 @@
         function updateOverlay() {
             if (activeIdx < 0 || !subRows[activeIdx]) {
                 subtitleOverlay.textContent = '';
+                subtitleOverlay.classList.add('ghost');   // 空档期显示可拖占位框
                 return;
             }
             const text = (subRows[activeIdx].text || '').trim();
-            if (!text) { subtitleOverlay.textContent = ''; return; }
+            if (!text) {
+                subtitleOverlay.textContent = '';
+                subtitleOverlay.classList.add('ghost');
+                return;
+            }
+            subtitleOverlay.classList.remove('ghost');
             const dispH = (editVideo.getBoundingClientRect().height
                 || editVideo.clientHeight || 240);
             const font = Math.max(10,
@@ -713,6 +748,210 @@
         editVideo.addEventListener('loadedmetadata', updateOverlay);
         window.addEventListener('resize', updateOverlay);
         document.addEventListener('fullscreenchange', updateOverlay);
+
+        // ------------------------------------------------------------------
+        // 字幕位置自定义（所见即所得）：
+        // - 拖动视频里的字幕（或空档期的虚线占位框）任意放置；
+        // - 9 宫格预设快速定位；「恢复默认」回到底部居中；
+        // - 位置实时保存到后端（PUT /api/style），烧录走 ASS \pos 精确复现。
+        // 坐标口径：pos 为字幕锚点在「视频内容区」中的比例，锚点随区域变化——
+        //   左区(pos_x<=0.35) 锚文本左边中点、右区(>=0.65) 锚右边中点、
+        //   中区锚文本块中心，与烧录 ASS Alignment 4/6/5 一一对应。
+        // 浏览器视频可能信箱式留边（元素框 ≠ 内容区），必须按内容区换算，
+        // 否则宽高比不一致时拖放位置与烧录结果会有偏差。
+        // ------------------------------------------------------------------
+        const ZONE_LEFT_MAX = 0.35, ZONE_RIGHT_MIN = 0.65;
+        const ASS_PLAY_RES_X = 384;
+        const ZONE_MARGIN_PR = 12;    // 与后端 wrap_text 的 PlayRes 边距一致
+
+        function zoneOf(px) {
+            if (!editPos) return 'center';
+            if (editPos.x <= ZONE_LEFT_MAX) return 'left';
+            if (editPos.x >= ZONE_RIGHT_MIN) return 'right';
+            return 'center';
+        }
+
+        function videoContentRectRel() {
+            // 视频「内容区」相对 videoBox 的矩形（含 letterbox 修正）
+            const vb = videoBox.getBoundingClientRect();
+            const vr = editVideo.getBoundingClientRect();
+            const vw = editVideo.videoWidth || 0;
+            const vh = editVideo.videoHeight || 0;
+            if (!vw || !vh) return { x: 0, y: 0, w: vr.width, h: vr.height };
+            const vAspect = vw / vh;
+            const eAspect = vr.width / vr.height || vAspect;
+            let w = vr.width, h = vr.height;
+            if (eAspect > vAspect) { w = vr.height * vAspect; }
+            else if (eAspect < vAspect) { h = vr.width / vAspect; }
+            return {
+                x: vr.left - vb.left + (vr.width - w) / 2,
+                y: vr.top - vb.top + (vr.height - h) / 2,
+                w: w, h: h,
+            };
+        }
+
+        function applyOverlayPosition() {
+            if (!subtitleOverlay) return;
+            if (editPos) {
+                const cr = videoContentRectRel();
+                const zone = zoneOf(editPos.x);
+                // 锚点与烧录 \pos（Alignment 4/5/6）口径一致：
+                // 左区锚左边中点、右区锚右边中点、中区锚中心，垂直均居中
+                subtitleOverlay.style.left = (cr.x + editPos.x * cr.w) + 'px';
+                subtitleOverlay.style.top = (cr.y + editPos.y * cr.h) + 'px';
+                subtitleOverlay.style.right = 'auto';
+                subtitleOverlay.style.bottom = 'auto';
+                subtitleOverlay.style.transform = zone === 'left'
+                    ? 'translate(0, -50%)'
+                    : zone === 'right' ? 'translate(-100%, -50%)'
+                    : 'translate(-50%, -50%)';
+                subtitleOverlay.style.textAlign = zone;
+                // 预览换行宽度与后端 wrap_text 同公式（CSS 自动换行近似模拟）
+                const pxPerPR = cr.w / ASS_PLAY_RES_X;
+                const xPR = editPos.x * ASS_PLAY_RES_X;
+                const maxPR = zone === 'left'
+                    ? ASS_PLAY_RES_X - xPR - ZONE_MARGIN_PR
+                    : zone === 'right' ? xPR - ZONE_MARGIN_PR
+                    : 2 * Math.min(xPR, ASS_PLAY_RES_X - xPR) - 2 * ZONE_MARGIN_PR;
+                subtitleOverlay.style.maxWidth = Math.max(60, maxPR * pxPerPR) + 'px';
+                subtitleOverlay.classList.remove('align-left', 'align-center', 'align-right');
+                subtitleOverlay.classList.add('align-' + zone);
+            } else {
+                // 默认：底部居中，底边 = 烧录 MarginV 比例（80/288 ≈ 28%）
+                subtitleOverlay.style.left = '';
+                subtitleOverlay.style.top = '';
+                subtitleOverlay.style.right = '';
+                subtitleOverlay.style.bottom =
+                    Math.round((ASS_MARGIN_V / ASS_PLAY_RES_Y) * 100) + '%';
+                subtitleOverlay.style.transform = '';
+                subtitleOverlay.style.textAlign = '';
+                subtitleOverlay.style.maxWidth = '';
+                subtitleOverlay.classList.remove('align-left', 'align-center', 'align-right');
+            }
+        }
+
+        function highlightPosPreset() {
+            if (!posGrid) return;
+            posGrid.querySelectorAll('button').forEach((btn) => {
+                const on = !!editPos
+                    && Math.abs(parseFloat(btn.dataset.x) - editPos.x) < 0.01
+                    && Math.abs(parseFloat(btn.dataset.y) - editPos.y) < 0.01;
+                btn.classList.toggle('active', on);
+            });
+        }
+
+        function clampPos(v) {
+            return Math.min(0.97, Math.max(0.03, v));
+        }
+
+        function setSubtitlePosition(x, y, save) {
+            editPos = { x: clampPos(x), y: clampPos(y) };
+            applyOverlayPosition();
+            highlightPosPreset();
+            if (save) saveStylePosition(editPos.x, editPos.y);
+        }
+
+        function resetSubtitlePosition(save) {
+            editPos = null;
+            applyOverlayPosition();
+            highlightPosPreset();
+            if (save) resetStylePosition();
+        }
+
+        async function saveStylePosition(x, y) {
+            if (!editTaskId) return;
+            try {
+                const resp = await fetch('/api/style/' + editTaskId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pos_x: x, pos_y: y })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || '保存失败');
+                if (data.style) editStyle = data.style;
+                showInfo('字幕位置已保存，烧录时生效');
+            } catch (e) {
+                showError('字幕位置保存失败：' + e.message);
+            }
+        }
+
+        async function resetStylePosition() {
+            if (!editTaskId) return;
+            try {
+                const resp = await fetch('/api/style/' + editTaskId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reset_position: true })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || '保存失败');
+                if (data.style) editStyle = data.style;
+                showInfo('已恢复默认底部位置');
+            } catch (e) {
+                showError('恢复默认位置失败：' + e.message);
+            }
+        }
+
+        // 拖拽：pointer capture 保证拖出视频区仍持续跟踪；touch 需禁滚动
+        let posDragging = false;
+        let posGrabDX = 0, posGrabDY = 0;   // 指针相对字幕「锚点」的偏移，拖动中保持
+        subtitleOverlay.addEventListener('pointerdown', (e) => {
+            if (phase !== 'editing' || !editTaskId) return;
+            posDragging = true;
+            const r = subtitleOverlay.getBoundingClientRect();
+            // 锚点取当前区域的渲染锚（左/右/中），与烧录 \pos 语义一致，
+            // 拖动开始时字幕不跳位；跨区域拖动时对齐方式随之切换
+            const zone = zoneOf(editPos ? editPos.x : 0.5);
+            const anchorX = zone === 'left' ? r.left
+                : zone === 'right' ? r.right
+                : r.left + r.width / 2;
+            posGrabDX = anchorX - e.clientX;
+            posGrabDY = (r.top + r.height / 2) - e.clientY;
+            try { subtitleOverlay.setPointerCapture(e.pointerId); } catch (err) {}
+            subtitleOverlay.classList.add('dragging');
+            e.preventDefault();
+        });
+        subtitleOverlay.addEventListener('pointermove', (e) => {
+            if (!posDragging) return;
+            const cr = videoContentRectRel();
+            if (!cr.w || !cr.h) return;
+            const bx = videoBox.getBoundingClientRect();
+            const x = (e.clientX + posGrabDX - bx.left - cr.x) / cr.w;
+            const y = (e.clientY + posGrabDY - bx.top - cr.y) / cr.h;
+            editPos = { x: clampPos(x), y: clampPos(y) };
+            applyOverlayPosition();
+            highlightPosPreset();
+        });
+        function endPosDrag() {
+            if (!posDragging) return;
+            posDragging = false;
+            subtitleOverlay.classList.remove('dragging');
+            if (editPos) saveStylePosition(editPos.x, editPos.y);
+        }
+        subtitleOverlay.addEventListener('pointerup', endPosDrag);
+        subtitleOverlay.addEventListener('pointercancel', endPosDrag);
+
+        // 9 宫格预设 / 恢复默认
+        if (posGrid) {
+            posGrid.addEventListener('click', (e) => {
+                const btn = e.target.closest('button');
+                if (!btn || phase !== 'editing' || !editTaskId) return;
+                setSubtitlePosition(parseFloat(btn.dataset.x),
+                    parseFloat(btn.dataset.y), true);
+            });
+        }
+        if (posResetBtn) {
+            posResetBtn.addEventListener('click', () => {
+                if (phase !== 'editing' || !editTaskId) return;
+                resetSubtitlePosition(true);
+            });
+        }
+
+        // 尺寸/全屏变化时重算像素位置（比例不变）；全屏切换等下一帧布局稳定后再算
+        editVideo.addEventListener('loadedmetadata', applyOverlayPosition);
+        window.addEventListener('resize', applyOverlayPosition);
+        document.addEventListener('fullscreenchange',
+            () => requestAnimationFrame(applyOverlayPosition));
 
         // 全屏校对：视频 + 字幕浮层一起进全屏，便于逐帧对齐
         function toggleFullscreen() {

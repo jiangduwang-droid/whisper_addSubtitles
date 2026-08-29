@@ -484,6 +484,12 @@ h1.title {
     white-space: pre-wrap;
     word-break: break-word;
 }
+
+/* 自定义位置时的区域对齐（左/中/右区，与烧录 ASS Alignment 4/5/6 对应；
+   transform/位置由 JS 按内容区实时计算，这里只兜底文字对齐） */
+.subtitle-overlay.align-left { text-align: left; }
+.subtitle-overlay.align-center { text-align: center; }
+.subtitle-overlay.align-right { text-align: right; }
 .video-ctrl {
     display: flex;
     align-items: center;
@@ -496,6 +502,110 @@ h1.title {
     color: var(--text-2);
     font-variant-numeric: tabular-nums;
 }
+
+/* ------------------------------------------------------------------ */
+/* 字幕位置自定义工具条（9 宫格预设 + 恢复默认 + 拖拽提示）            */
+/* ------------------------------------------------------------------ */
+.pos-ctrl {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    padding: 9px 12px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+}
+.pc-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-2);
+    white-space: nowrap;
+}
+.pos-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 22px);
+    grid-template-rows: repeat(3, 22px);
+    gap: 3px;
+}
+.pos-grid button {
+    position: relative;
+    padding: 0;
+    border: 1px solid var(--card-border);
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background .12s, border-color .12s;
+}
+.pos-grid button::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.75);
+    transform: translate(-50%, -50%);
+}
+.pos-grid button:hover {
+    background: rgba(99, 102, 241, 0.35);
+    border-color: var(--accent-1);
+}
+.pos-grid button.active {
+    background: var(--accent-1);
+    border-color: var(--accent-3);
+    box-shadow: 0 0 8px rgba(99, 102, 241, 0.55);
+}
+.pos-grid button.active::after {
+    background: #fff;
+}
+.pc-tip {
+    flex: 1;
+    min-width: 170px;
+    font-size: 12px;
+    color: var(--text-3);
+}
+
+/* 校对期开启字幕拖拽：浮层可抓取（touch 拖动需禁默认滚动） */
+#videoBox.edit-live .subtitle-overlay {
+    pointer-events: auto;
+    cursor: grab;
+    touch-action: none;
+}
+#videoBox.edit-live .subtitle-overlay.dragging {
+    cursor: grabbing;
+    opacity: 0.88;
+    outline: 1.5px dashed rgba(34, 211, 238, 0.75);
+    outline-offset: 5px;
+    border-radius: 8px;
+}
+
+/* 空档期（当前无字幕文本）的可拖占位框：悬停视频时浮现 */
+.subtitle-overlay.ghost {
+    min-width: 150px;
+    min-height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1.5px dashed rgba(255, 255, 255, 0.5);
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.38);
+    opacity: 0;
+    transition: opacity .18s ease;
+}
+.subtitle-overlay.ghost::after {
+    content: '按住拖动 · 调整字幕位置';
+    font-size: 12px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.9);
+    -webkit-text-stroke: 0;
+    text-shadow: none;
+    white-space: nowrap;
+}
+#videoBox:hover .subtitle-overlay.ghost { opacity: 1; }
+#videoBox.edit-live .subtitle-overlay.ghost { pointer-events: auto; }
 
 .sub-row {
     padding: 10px 12px;

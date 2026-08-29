@@ -239,9 +239,11 @@ def _run_pipeline(task, opts):
             task.update(message='校对超时，按当前字幕继续')
 
         # 3) 字幕烧录（ffmpeg，只重编码字幕叠加后的视频，不整片 Python 逐帧处理）
+        #    样式取 task.style：校对页 PUT /api/style 更新过的（含自定义位置）优先生效
         task.update(stage='burning', progress=50, message='校对完成，正在烧录字幕')
         burner = RealizeAddSubtitles(
-            task.src_path, srt_path, out_path=task.out_path, style=opts['style'])
+            task.src_path, srt_path, out_path=task.out_path,
+            style=task.style or opts['style'])
         # ffmpeg 子进程上报的 pct 是 0~100：映射到总进度 50%~100%
         burner.burn(progress_cb=lambda pct: task.update(
             stage='burning', progress=50 + int(pct * 0.5),
@@ -600,6 +602,51 @@ def put_subtitles(task_id):
     except OSError:
         pass
     return jsonify({'ok': True, 'count': len(subs)})
+
+
+@app.route('/api/style/<task_id>', methods=['PUT'])
+def put_style(task_id):
+    """保存字幕样式（当前支持：自定义位置 pos_x/pos_y，0~1，定位点比例）。
+
+    位置语义与烧录口径一致：pos 是字幕锚点在画面中的相对坐标，锚点随区域
+    变化——左区(<=0.35)锚文本块左边中点（Alignment=4）、右区(>=0.65)锚右边
+    中点（Alignment=6）、中区锚文本块中心（Alignment=5），垂直方向均锚中心。
+    前端预览用同口径 transform 实时呈现；长文本烧录前会按区域宽度预换行，
+    避免无空格中文溢出画面（libass 不自动换行）。
+    """
+    task = REGISTRY.get(task_id)
+    if task is None:
+        return jsonify({'error': '任务不存在或已过期'}), 404
+    # 与字幕编辑同口径：确认后（烧录可能已启动）拒绝改动样式
+    if task.stage != 'awaiting_edit' or task.edit_confirmed.is_set():
+        return jsonify({'error': '当前阶段不能调整字幕样式（请在校对页操作）'}), 409
+
+    data = request.get_json(silent=True) or {}
+    style = dict(task.style or {})
+
+    if data.get('reset_position'):
+        style.pop('pos_x', None)
+        style.pop('pos_y', None)
+    else:
+        try:
+            pos_x = float(data.get('pos_x'))
+            pos_y = float(data.get('pos_y'))
+        except (TypeError, ValueError):
+            return jsonify({'error': '位置数据格式错误（需数字）'}), 400
+        # 限制在画面内且留出边距，防止字幕完全跑出可视区
+        # （NaN/Infinity 的比较结果为 False，同样会被拒绝）
+        if not (0.03 <= pos_x <= 0.97 and 0.03 <= pos_y <= 0.97):
+            return jsonify({'error': '位置超出范围（需 0.03~0.97）'}), 400
+        style['pos_x'] = round(pos_x, 4)
+        style['pos_y'] = round(pos_y, 4)
+
+    task.style = style
+    # 与字幕保存同款续命：校对页仍在操作，目录不应被清理线程回收
+    try:
+        os.utime(task.folder, None)
+    except OSError:
+        pass
+    return jsonify({'ok': True, 'style': style})
 
 
 @app.route('/api/confirm/<task_id>', methods=['POST'])
