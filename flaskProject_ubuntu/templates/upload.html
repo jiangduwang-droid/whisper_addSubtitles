@@ -503,9 +503,10 @@
 
         async function openEditor(taskId) {
             editTaskId = taskId;
+            let data = null;   // 函数级作用域：块外（editPos 恢复）还要用
             try {
                 const resp = await fetch('/api/subtitles/' + taskId);
-                const data = await resp.json();
+                data = await resp.json();
                 if (data.error) return fail(data.error);
                 subRows = (data.subtitles || []).map((s) => ({
                     start: s.start, end: s.end, text: s.text
