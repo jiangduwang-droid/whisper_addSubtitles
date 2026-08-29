@@ -144,6 +144,24 @@
                                 <button type="button" class="mini-btn" id="posResetBtn" title="清除自定义位置，恢复默认底部">恢复默认</button>
                                 <span class="pc-tip">选中后拖动视频里的字幕可微调，位置实时保存。拖到左/中/右区域会自动切换文字对齐方式并智能换行</span>
                             </div>
+                            <!-- 字幕样式调试：字号 + 文字/描边颜色，实时预览并保存 -->
+                            <div class="style-ctrl" id="styleCtrl">
+                                <span class="pc-label">字幕样式</span>
+                                <label class="sc-field" title="字号（8~100）">
+                                    <span class="sc-name">字号</span>
+                                    <input type="number" id="styleFontSize" min="8" max="100" step="1" value="32">
+                                </label>
+                                <label class="sc-field" title="文字颜色">
+                                    <span class="sc-name">文字</span>
+                                    <input type="color" id="styleTextColor" value="#FFFFFF">
+                                </label>
+                                <label class="sc-field" title="描边颜色">
+                                    <span class="sc-name">描边</span>
+                                    <input type="color" id="styleOutlineColor" value="#000000">
+                                </label>
+                                <button type="button" class="mini-btn" id="styleResetBtn" title="样式恢复默认（32 / 白字 / 黑描边）">恢复默认</button>
+                                <span class="pc-tip">调整后视频里的字幕实时变化并自动保存；空档期会显示样式预览字样</span>
+                            </div>
                         </div>
                         <div class="ed-list" id="subtitleList"></div>
                     </div>
@@ -234,6 +252,10 @@
         const subtitleList = document.getElementById('subtitleList');
         const posGrid = document.getElementById('posGrid');
         const posResetBtn = document.getElementById('posResetBtn');
+        const styleFontSize = document.getElementById('styleFontSize');
+        const styleTextColor = document.getElementById('styleTextColor');
+        const styleOutlineColor = document.getElementById('styleOutlineColor');
+        const styleResetBtn = document.getElementById('styleResetBtn');
         const confirmEditBtn = document.getElementById('confirmEditBtn');
         const saveEditBtn = document.getElementById('saveEditBtn');
         const skipEditBtn = document.getElementById('skipEditBtn');
@@ -525,6 +547,8 @@
                 : null;
             applyOverlayPosition();
             highlightPosPreset();
+            syncStyleControls();    // 样式控件回显已保存的字号/颜色
+            updateOverlay();        // 空档期也立即显示样式预览字样
             videoBox.classList.add('edit-live');   // 开启字幕拖拽
             // 编辑器打开时页面加宽，给视频预览更多空间
             pageCard.classList.add('expanded');
@@ -538,6 +562,8 @@
         function closeEditor() {
             editTaskId = null;
             previewPollToken++;   // 使进行中的预览轮询失效
+            clearTimeout(styleSaveTimer);   // 挂起的样式自动保存一并取消
+            styleSaveTimer = null;
             subRows = [];
             editDirty = false;
             activeIdx = -1;
@@ -722,18 +748,21 @@
         const ASS_PLAY_RES_Y = 288;
         const ASS_MARGIN_V = 80;
         function updateOverlay() {
-            if (activeIdx < 0 || !subRows[activeIdx]) {
-                subtitleOverlay.textContent = '';
-                subtitleOverlay.classList.add('ghost');   // 空档期显示可拖占位框
-                return;
-            }
-            const text = (subRows[activeIdx].text || '').trim();
-            if (!text) {
-                subtitleOverlay.textContent = '';
+            // 空档期：显示带当前样式的预览字样（既是可拖占位框，也是样式调整的
+            // 实时反馈——暂停/无字幕时也能看到字号颜色的效果）
+            if (activeIdx < 0 || !subRows[activeIdx]
+                || !(subRows[activeIdx].text || '').trim()) {
                 subtitleOverlay.classList.add('ghost');
+                applyOverlayStyle();
+                subtitleOverlay.textContent = '字幕样式预览';
                 return;
             }
             subtitleOverlay.classList.remove('ghost');
+            applyOverlayStyle();
+            subtitleOverlay.textContent = (subRows[activeIdx].text || '').trim();
+        }
+
+        function applyOverlayStyle() {
             const dispH = (editVideo.getBoundingClientRect().height
                 || editVideo.clientHeight || 240);
             const font = Math.max(10,
@@ -744,7 +773,6 @@
                 Math.max(1, Math.round(font * 0.06)) + 'px';
             subtitleOverlay.style.webkitTextStrokeColor =
                 editStyle.outline_color || '#000000';
-            subtitleOverlay.textContent = text;
         }
         editVideo.addEventListener('loadedmetadata', updateOverlay);
         window.addEventListener('resize', updateOverlay);
@@ -891,6 +919,94 @@
             } catch (e) {
                 showError('恢复默认位置失败：' + e.message);
             }
+        }
+
+        // ------------------------------------------------------------------
+        // 字幕样式调试（字号 + 文字/描边颜色）：
+        // 即改即预览（updateOverlay 实时应用当前 editStyle），停手 600ms 自动
+        // 保存。与上传时同一口径（字号 8~100 / 颜色 #RRGGBB），烧录两条路径
+        // （带位置走 ASS \pos、无位置走 force_style）都读 task.style 这三项。
+        // ------------------------------------------------------------------
+        let styleSaveTimer = null;
+
+        function syncStyleControls() {
+            // editStyle -> 控件（打开编辑器 / 保存回读后调用）
+            if (styleFontSize) styleFontSize.value = editStyle.font_size || 32;
+            if (styleTextColor) styleTextColor.value = editStyle.text_color || '#FFFFFF';
+            if (styleOutlineColor) {
+                styleOutlineColor.value = editStyle.outline_color || '#000000';
+            }
+        }
+
+        function onStyleInput() {
+            if (phase !== 'editing' || !editTaskId) return;
+            const size = parseInt(styleFontSize.value, 10);
+            // 字号非法（空/非数字）时不动预览，等合法输入或恢复默认
+            if (!isNaN(size)) {
+                editStyle.font_size = Math.max(8, Math.min(100, size));
+            }
+            if (styleTextColor.value) {
+                editStyle.text_color = styleTextColor.value.toUpperCase();
+            }
+            if (styleOutlineColor.value) {
+                editStyle.outline_color = styleOutlineColor.value.toUpperCase();
+            }
+            updateOverlay();          // 空档期 ghost 也会同步新样式
+            clearTimeout(styleSaveTimer);
+            styleSaveTimer = setTimeout(saveStyleLook, 600);
+        }
+
+        async function saveStyleLook() {
+            if (!editTaskId) return;
+            styleSaveTimer = null;
+            try {
+                const resp = await fetch('/api/style/' + editTaskId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        font_size: editStyle.font_size,
+                        text_color: editStyle.text_color,
+                        outline_color: editStyle.outline_color
+                    })
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || '保存失败');
+                if (data.style) editStyle = data.style;
+                syncStyleControls();
+                updateOverlay();
+                showInfo('字幕样式已保存，烧录时生效');
+            } catch (e) {
+                showError('字幕样式保存失败：' + e.message);
+            }
+        }
+
+        if (styleFontSize) {
+            styleFontSize.addEventListener('input', onStyleInput);
+            styleFontSize.addEventListener('change', onStyleInput);
+        }
+        if (styleTextColor) styleTextColor.addEventListener('input', onStyleInput);
+        if (styleOutlineColor) styleOutlineColor.addEventListener('input', onStyleInput);
+        if (styleResetBtn) {
+            styleResetBtn.addEventListener('click', async () => {
+                if (!editTaskId) return;
+                try {
+                    const resp = await fetch('/api/style/' + editTaskId, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ reset_style: true })
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok || data.error) {
+                        throw new Error(data.error || '保存失败');
+                    }
+                    if (data.style) editStyle = data.style;
+                    syncStyleControls();
+                    updateOverlay();
+                    showInfo('字幕样式已恢复默认（32 / 白字 / 黑描边）');
+                } catch (e) {
+                    showError('恢复默认样式失败：' + e.message);
+                }
+            });
         }
 
         // 拖拽：pointer capture 保证拖出视频区仍持续跟踪；touch 需禁滚动

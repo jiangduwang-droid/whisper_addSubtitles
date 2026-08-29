@@ -162,12 +162,18 @@ TRANSCRIBE_OPTS = TranscribeArgs(
 ALLOWED_MODELS = ('tiny', 'base', 'small', 'medium', 'large-v2', 'large-v3')
 ALLOWED_LANGS = ('auto', 'zh', 'en')
 HEX_COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
+# 字幕样式默认值（上传解析与校对页 reset_style 共用同一份）
+DEFAULT_STYLE = {'font_size': 32, 'text_color': '#FFFFFF', 'outline_color': '#000000'}
 
 
 def _to_int(value, default, lo, hi):
+    """字符串/数字 -> 夹紧到 [lo, hi] 的整数；浮点截断（45.9 -> 45）。
+
+    非数字（含 NaN/Infinity）回退 default。
+    """
     try:
-        n = int(str(value).strip())
-    except (TypeError, ValueError):
+        n = int(float(str(value).strip()))
+    except (TypeError, ValueError, OverflowError):
         return default
     return max(lo, min(hi, n))
 
@@ -606,13 +612,17 @@ def put_subtitles(task_id):
 
 @app.route('/api/style/<task_id>', methods=['PUT'])
 def put_style(task_id):
-    """保存字幕样式（当前支持：自定义位置 pos_x/pos_y，0~1，定位点比例）。
+    """保存字幕样式（校对页所见即所得调整，烧录时生效）。
 
-    位置语义与烧录口径一致：pos 是字幕锚点在画面中的相对坐标，锚点随区域
-    变化——左区(<=0.35)锚文本块左边中点（Alignment=4）、右区(>=0.65)锚右边
-    中点（Alignment=6）、中区锚文本块中心（Alignment=5），垂直方向均锚中心。
-    前端预览用同口径 transform 实时呈现；长文本烧录前会按区域宽度预换行，
-    避免无空格中文溢出画面（libass 不自动换行）。
+    支持字段（可单独提交、任意组合）：
+    - font_size：字号（8~100，ASS PlayRes 288 基准，与上传时同一口径）
+    - text_color / outline_color：文字/描边颜色（#RRGGBB）
+    - reset_style: true：样式恢复默认（32 / #FFFFFF / #000000）
+    - pos_x / pos_y：自定义位置（0.03~0.97，锚点随区域变化——左区锚文本
+      左边中点 Alignment=4、右区锚右边中点 6、中区锚中心 5，与烧录一致）
+    - reset_position: true：清除自定义位置回到底部居中
+
+    前端预览用同口径实时呈现；长文本烧录前按区域宽度预换行（libass 不换行）。
     """
     task = REGISTRY.get(task_id)
     if task is None:
@@ -623,11 +633,14 @@ def put_style(task_id):
 
     data = request.get_json(silent=True) or {}
     style = dict(task.style or {})
+    updated = []
 
+    # ---- 位置（可选） ----
     if data.get('reset_position'):
         style.pop('pos_x', None)
         style.pop('pos_y', None)
-    else:
+        updated.append('position')
+    elif 'pos_x' in data or 'pos_y' in data:
         try:
             pos_x = float(data.get('pos_x'))
             pos_y = float(data.get('pos_y'))
@@ -639,6 +652,31 @@ def put_style(task_id):
             return jsonify({'error': '位置超出范围（需 0.03~0.97）'}), 400
         style['pos_x'] = round(pos_x, 4)
         style['pos_y'] = round(pos_y, 4)
+        updated.append('position')
+
+    # ---- 字号 / 颜色（可选） ----
+    if data.get('reset_style'):
+        style['font_size'] = DEFAULT_STYLE['font_size']
+        style['text_color'] = DEFAULT_STYLE['text_color']
+        style['outline_color'] = DEFAULT_STYLE['outline_color']
+        updated.append('style')
+    else:
+        if 'font_size' in data:
+            # 非数字回退默认值，超界夹紧到范围内（与上传解析同一口径）
+            style['font_size'] = _to_int(data.get('font_size'),
+                                         DEFAULT_STYLE['font_size'], 8, 100)
+            updated.append('style')
+        for key in ('text_color', 'outline_color'):
+            if key in data:
+                color = str(data.get(key) or '').strip().upper()
+                if not HEX_COLOR_RE.match(color):
+                    return jsonify(
+                        {'error': f'{key} 格式错误（需 #RRGGBB）'}), 400
+                style[key] = color
+                updated.append('style')
+
+    if not updated:
+        return jsonify({'error': '请求中没有任何可更新的样式字段'}), 400
 
     task.style = style
     # 与字幕保存同款续命：校对页仍在操作，目录不应被清理线程回收
