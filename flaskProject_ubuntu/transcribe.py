@@ -336,27 +336,45 @@ class Transcribe:
                     chunks.append((c, min(c + step, e)))
                     c += step
 
-        results = []
-        info_lang, info = 'zh', None
-        done_samples = 0
+        # ---- 阶段 1：逐段语言检测（仅 encoder 前向，代价小） ----
+        # 相邻同语言的段合并成大段后再转写：真实双语视频里语言是
+        # 「大块连续」的（整段中文讲解 + 整段英文对白），合并后
+        # 转写调用次数从「句数级」降到「语言切换次数级」，长视频提速明显。
+        detected = []   # [(start, end, lang)]
         for i, (s, e) in enumerate(chunks):
-            seg_wave = wave[s:e]
-            if len(seg_wave) < 8000:   # <0.5s 的碎片跳过
-                done_samples = e
+            if e - s < 8000:   # <0.5s 的碎片跳过
                 continue
-            # 逐段检测语言，限定 zh/en（其它语言按 zh 处理，服务定位即中英）
             try:
-                det, prob, _ = self.whisper_model.detect_language(seg_wave)
+                det, _prob, _ = self.whisper_model.detect_language(wave[s:e])
             except Exception:
-                det, prob = 'zh', 0.0
+                det = 'zh'
             if det not in ('zh', 'en'):
                 det = 'zh'
+            detected.append([s, e, det])
+            self._report('transcribing',
+                         max(0.05, min(0.4, e / max(total_samples, 1))),
+                         f'正在检测语言 {i + 1}/{len(chunks)} 段')
+
+        # ---- 阶段 2：相邻同语言段合并（总长 <=30s whisper 窗口） ----
+        lang_groups = []
+        for s, e, lang in detected:
+            if lang_groups and lang_groups[-1][2] == lang \
+                    and e - lang_groups[-1][0] <= 16000 * 30:
+                lang_groups[-1][1] = e
+            else:
+                lang_groups.append([s, e, lang])
+
+        # ---- 阶段 3：逐大段转写，时间轴平移拼回 ----
+        results = []
+        info_lang, info = 'zh', None
+        for i, (s, e, det) in enumerate(lang_groups):
             prompt = '以下是普通话的句子。' if det == 'zh' else ''
             self._report('transcribing',
-                         max(0.05, min(0.95, done_samples / max(total_samples, 1))),
-                         f'正在识别第 {i + 1}/{len(chunks)} 段（{"中文" if det == "zh" else "英文"}）')
+                         max(0.4, min(0.95, e / max(total_samples, 1))),
+                         f'正在识别第 {i + 1}/{len(lang_groups)} 段'
+                         f'（{"中文" if det == "zh" else "英文"}）')
             segs_iter, seg_info = self.whisper_model.transcribe(
-                seg_wave, language=det, beam_size=5,
+                wave[s:e], language=det, beam_size=5,
                 vad_filter=False, initial_prompt=prompt)
             for seg in segs_iter:
                 text = seg.text.strip()
@@ -372,7 +390,6 @@ class Transcribe:
             if i == 0:
                 info = seg_info
                 info_lang = det
-            done_samples = e
 
         if not results:
             logging.warning('bilingual transcription produced nothing, '
