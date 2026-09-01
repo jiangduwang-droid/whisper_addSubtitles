@@ -1,7 +1,10 @@
+import copy
 import datetime
 import gc
 import logging
 import os
+import subprocess
+import tempfile
 import threading
 import time
 
@@ -10,10 +13,24 @@ import srt
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
+# ffprobe 与 ffmpeg 同目录的约定（与 app.py 保持一致；环境变量优先）
+FFPROBE_BIN = os.environ.get('FFPROBE_BIN') or os.path.join(
+    os.path.dirname(os.path.abspath(subprocess.run(
+        ['which', 'ffmpeg'], capture_output=True, text=True).stdout.strip()
+        or '/usr/bin/ffmpeg')), 'ffprobe')
+
 # 国内服务器直连 HuggingFace 不通，默认走镜像下载模型；已显式设置时保留用户配置。
 # 同时禁用 xet 协议（镜像不支持），改走传统 HTTP 下载。
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
+
+# 中英混合模式标识：上传页选择「中英混合」时 lang 传 'zh+en'。
+# Whisper 单次调用只支持一种语言（language 是全局解码约束），自动检测
+# 或指定语言后，非主导语言的句子会被直接跳过——实测 28 秒中英交替
+# 音频在 auto/zh 下英文句全部丢失（CER 69.6%）。因此混合模式按
+# 「VAD 切句 -> 每句独立检测语言(限定 zh/en) -> 分语言转写 -> 拼回全片
+# 时间轴」处理，实测同样音频 7 句全部正确识别。
+BILINGUAL_LANG = 'zh+en'
 
 
 class TranscribeArgs:
@@ -167,6 +184,15 @@ def _get_opencc():
         return _OPENCC
 
 
+class _FakedInfo:
+    """双语路径拼装的转写信息（run_single 只用到 language/duration）。"""
+
+    def __init__(self, language, duration):
+        self.language = language
+        self.duration = duration
+        self.language_probability = 1.0
+
+
 class Transcribe:
     def __init__(self, args, progress_cb=None):
         self.args = args
@@ -200,10 +226,20 @@ class Transcribe:
         tic = time.time()
         self.whisper_model = _get_model(self.args)
 
+        if (self.args.lang or '') == BILINGUAL_LANG:
+            # 中英混合：分段检测语言 + 分段转写（见 BILINGUAL_LANG 注释）
+            return self._transcribe_bilingual(input_path)
+
         # 中文场景用简短初始提示，引导简体输出、稳定标点
         prompt = self.args.prompt
         if not prompt and self.args.lang in ('zh', 'zh-CN', 'chinese'):
             prompt = '以下是普通话的句子。'
+        elif not prompt and self.args.lang is None:
+            # auto 模式：先探一次语言（只看前 30 秒，代价很小）。
+            # 不加引导时 Whisper 中文常输出繁体且标点不稳
+            # （实测 base 模型纯中文 CER 23.1%，加引导后 0%）。
+            if self._probe_language(input_path) == 'zh':
+                prompt = '以下是普通话的句子。'
 
         self._report('transcribing', 0.1, '正在识别语音')
         segments, info = self.whisper_model.transcribe(
@@ -223,6 +259,145 @@ class Transcribe:
             pct = max(0.1, min(0.95, seg.end / total_dur))
             self._report('transcribing', pct, f'已识别 {len(results)} 句')
         logging.info(f'Done transcription in {time.time() - tic:.1f} sec')
+        return results, info
+
+    def _probe_language(self, input_path):
+        """探测音频语言（只取前 30 秒），auto 模式决定是否加中文引导。"""
+        try:
+            from faster_whisper import decode_audio
+            tmp = None
+            try:
+                # ffmpeg 切前 30 秒成临时 wav，避免整片解码占用内存
+                fd, tmp = tempfile.mkstemp(suffix='.wav')
+                os.close(fd)
+                r = subprocess.run(
+                    [FFPROBE_BIN, '-v', 'error', '-t', '30', '-i', input_path,
+                     '-vn', '-ar', '16000', '-ac', '1', '-y', tmp],
+                    capture_output=True, timeout=120)
+                if r.returncode != 0:
+                    return None
+                wave = decode_audio(tmp, sampling_rate=16000)
+                if len(wave) < 1600:   # 不足 0.1s 不判
+                    return None
+                lang, _, _ = self.whisper_model.detect_language(wave)
+                return lang
+            finally:
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+        except Exception as e:  # 探测失败不影响主流程（退回无引导）
+            logging.warning(f'language probe failed: {e}')
+            return None
+
+    def _transcribe_bilingual(self, input_path):
+        """中英混合转写：VAD 切句 -> 逐句检测语言 -> 分语言转写。
+
+        时间轴 = 各段在全片中的偏移 + 段内相对时间，直接拼回原视频。
+        """
+        from faster_whisper import decode_audio
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+        tic = time.time()
+        self._report('transcribing', 0.02, '正在读取音频')
+        wave = decode_audio(input_path, sampling_rate=16000)
+        total_samples = len(wave)
+
+        self._report('transcribing', 0.05, '正在切分语音段')
+        # speech_pad 关键：默认 400ms 会把两侧各 0.4s 的句间静音填满，
+        # 相邻句被粘连成整段、语言检测退回主导语言（实测丢英文句）。
+        # 收窄到 120ms 并保留句子边界，双语视频才能逐句检测语言。
+        vad_opts = VadOptions(min_silence_duration_ms=350, speech_pad_ms=120)
+        ts = get_speech_timestamps(wave, vad_opts)
+        if not ts:
+            # VAD 没切出语音：退回整片按 zh 转写，至少能出结果
+            return self._transcribe_monolingual(input_path, 'zh')
+
+        # 合并被 VAD 撕裂的碎片（间隔 <0.2s 视为同句），并限制单段最长 30s
+        # （whisper 窗口）。间隔必须收得很小——双语视频句间停顿就是语言切换点。
+        merged = []
+        for t in ts:
+            s, e = t['start'], t['end']
+            if merged and s - merged[-1][1] < 16000 * 0.2 \
+                    and e - merged[-1][0] <= 16000 * 30:
+                merged[-1][1] = e
+            else:
+                merged.append([s, e])
+        chunks = []
+        for s, e in merged:
+            if e - s <= 16000 * 30:
+                chunks.append((s, e))
+            else:
+                # 超长段按 30s 窗口切（简单等分尾部容差）
+                step = 16000 * 30
+                c = s
+                while c < e:
+                    chunks.append((c, min(c + step, e)))
+                    c += step
+
+        results = []
+        info_lang, info = 'zh', None
+        done_samples = 0
+        for i, (s, e) in enumerate(chunks):
+            seg_wave = wave[s:e]
+            if len(seg_wave) < 8000:   # <0.5s 的碎片跳过
+                done_samples = e
+                continue
+            # 逐段检测语言，限定 zh/en（其它语言按 zh 处理，服务定位即中英）
+            try:
+                det, prob, _ = self.whisper_model.detect_language(seg_wave)
+            except Exception:
+                det, prob = 'zh', 0.0
+            if det not in ('zh', 'en'):
+                det = 'zh'
+            prompt = '以下是普通话的句子。' if det == 'zh' else ''
+            self._report('transcribing',
+                         max(0.05, min(0.95, done_samples / max(total_samples, 1))),
+                         f'正在识别第 {i + 1}/{len(chunks)} 段（{"中文" if det == "zh" else "英文"}）')
+            segs_iter, seg_info = self.whisper_model.transcribe(
+                seg_wave, language=det, beam_size=5,
+                vad_filter=False, initial_prompt=prompt)
+            for seg in segs_iter:
+                text = seg.text.strip()
+                if not text:
+                    continue
+                # 拼回全片时间轴（浅拷贝保留全部字段后平移 start/end；
+                # Segment 非 NamedTuple，没有 _replace）
+                offset = s / 16000.0
+                shifted = copy.copy(seg)
+                shifted.start = seg.start + offset
+                shifted.end = seg.end + offset
+                results.append(shifted)
+            if i == 0:
+                info = seg_info
+                info_lang = det
+            done_samples = e
+
+        if not results:
+            logging.warning('bilingual transcription produced nothing, '
+                            'fallback to monolingual zh')
+            return self._transcribe_monolingual(input_path, 'zh')
+
+        # 构造一个与 _transcribe 兼容的 info（仅用到 language/duration 字段）
+        info_lang = info_lang or 'zh'
+        total_dur = total_samples / 16000.0
+        self._report('transcribing', 0.95, f'已识别 {len(results)} 句')
+        logging.info(f'Done bilingual transcription: {len(results)} segments '
+                     f'in {time.time() - tic:.1f} sec')
+        return results, _FakedInfo(info_lang, total_dur)
+
+    def _transcribe_monolingual(self, input_path, lang):
+        """单语言兜底转写（双语路径 VAD 无结果/无产出时使用）。"""
+        prompt = '以下是普通话的句子。' if lang == 'zh' else ''
+        segments, info = self.whisper_model.transcribe(
+            input_path, language=lang, beam_size=5,
+            vad_filter=self.args.vad, initial_prompt=prompt)
+        results = list(segments)
+        total_dur = info.duration or 1.0
+        for seg in results:
+            pct = max(0.1, min(0.95, seg.end / total_dur))
+            self._report('transcribing', pct, f'已识别 {len(results)} 句')
         return results, info
 
     def _save_srt(self, output, segments):

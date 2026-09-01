@@ -160,7 +160,9 @@ TRANSCRIBE_OPTS = TranscribeArgs(
 # 前端可配置项：语言 / 模型 / 字幕样式（大小、颜色）
 # ---------------------------------------------------------------------------
 ALLOWED_MODELS = ('tiny', 'base', 'small', 'medium', 'large-v2', 'large-v3')
-ALLOWED_LANGS = ('auto', 'zh', 'en')
+# 'zh+en'：中英混合模式（VAD 切句后逐句检测语言、分语言转写，
+# Whisper 单次调用无法识别混合语言——详见 transcribe.py 注释）
+ALLOWED_LANGS = ('auto', 'zh', 'en', 'zh+en')
 HEX_COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
 # 字幕样式默认值（上传解析与校对页 reset_style 共用同一份）
 DEFAULT_STYLE = {'font_size': 32, 'text_color': '#FFFFFF', 'outline_color': '#000000'}
@@ -181,6 +183,10 @@ def _to_int(value, default, lo, hi):
 def _parse_options(form):
     """解析并校验上传附带的配置，任何非法输入都回退到安全默认值。"""
     lang = (form.get('language') or 'auto').strip().lower()
+    # 混合模式归一化：urlencoded 传输时 '+' 会被解码为空格（'zh en'），
+    # 以及 'zh-en' 等变体，统一成内部标识 'zh+en'
+    if lang.replace(' ', '').replace('-', '') == 'zhen':
+        lang = 'zh+en'
     if lang not in ALLOWED_LANGS:
         lang = 'auto'
     lang = None if lang == 'auto' else lang
